@@ -776,11 +776,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const commandCwd = permissionLaunchCwd(turn.cwd ?? homedir());
         const releaseSlot = tryCodexLaunchSlot() ?? await waitForLaunchSlot(attempt);
         if (!releaseSlot) return;
-        const child = spawnHoldingSlot(releaseSlot, () => spawnCli(...codexLaunch(config.cli, appServerArgs), {
-          cwd: turn.cwd ?? homedir(),
-          env,
-          stdio: ["pipe", "pipe", "pipe"],
-        }, "bot"));
+        let child: ReturnType<typeof spawnCli>;
+        try {
+          child = spawnHoldingSlot(releaseSlot, () => spawnCli(...codexLaunch(config.cli, appServerArgs), {
+            cwd: turn.cwd ?? homedir(), env, stdio: ["pipe", "pipe", "pipe"],
+          }, "bot"));
+        } catch (error) {
+          if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
+          if (!announced) emit({ ...base(threadId, turnId), type: "turn.started" });
+          emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(error as NodeJS.ErrnoException, config.cli, turn.cwd ?? homedir()) });
+          emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "spawn_error", cost: null });
+          return;
+        }
 
       let abandoned = false;
       let codexThreadId: string | null = null;

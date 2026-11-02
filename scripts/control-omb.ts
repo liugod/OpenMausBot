@@ -170,6 +170,12 @@ export function verificationServerEnvironment(parentEnv: NodeJS.ProcessEnv, data
   }
   // Enables POST /api/testing/org-library; the route does not exist without it.
   if (parentEnv.OMB_TEST_ORG_LIBRARY_KEY) childEnv.OMB_TEST_ORG_LIBRARY_KEY = parentEnv.OMB_TEST_ORG_LIBRARY_KEY;
+  if (parentEnv.OMB_PERSISTENT_WORK_PREVIEW === "1") childEnv.OMB_PERSISTENT_WORK_PREVIEW = "1";
+  if (parentEnv.OMB_PERSISTENT_WORK_RUNTIME_TEST === "1") childEnv.OMB_PERSISTENT_WORK_RUNTIME_TEST = "1";
+  // Real-model fixture only: retain the caller's network route without exposing it in logs.
+  if (parentEnv.OMB_PERSISTENT_WORK_RUNTIME_TEST === "1" && parentEnv.OMB_VERIFY_ALLOW_PROXY === "1") {
+    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]) if (parentEnv[key]) childEnv[key] = parentEnv[key];
+  }
   // One log line per browser call and preview frame.
   if (parentEnv.OMB_BROWSER_TIMING === "1") childEnv.OMB_BROWSER_TIMING = "1";
   // Warm summaries' minutes as seconds (server/warm-summary.ts), and the switch that turns them off.

@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -10,6 +10,10 @@ import { needsInputQuestion, RuntimeCoordinator, view } from "./runtime-coordina
 import { ENVELOPE_MARK } from "./runtime/envelope.ts";
 import type { Assignment, Level, Limits } from "./runtime/types.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
+import { openGoalStore } from "./goals/goal-store.ts";
+import { openExecutionBudgetStore } from "./goals/execution-budget.ts";
+import { createGoalScheduler } from "./goals/scheduler.ts";
+import { createPersistentGoalHost } from "./goals/host-service.ts";
 
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -109,6 +113,92 @@ const base: Assignment = {
 const row = (patch: Partial<Assignment>): Assignment => ({ ...base, ...patch });
 const roomRow = (patch: Partial<Assignment> = {}): Assignment => row({ assignee: { botId: "builder", destination: { kind: "room_thread", threadId: "room-1", groupId: "g1" } }, ...patch });
 
+describe("persistent goal host service", () => {
+  it("automatically checks, reviews and completes an isolated standalone work item", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "goal-host-pipeline-"));
+    const workspace = join(dir, "workspace"); mkdirSync(workspace);
+    const service = createPersistentGoalHost({ dataDir: dir, isLocalDataDir: () => true, authorize: () => true,
+      confirmStopped: () => true, resolveAuthorizedRoots: () => [workspace], isCurrentTurn: () => true, log: () => {},
+      prepareReadyReview: candidate => ({ goalId: candidate.goalId, attemptId: "review", authorizationRef: "owner", request: {
+        dispatchKey: "review-key", rootId: "review-root", requesterRef: "review", origin: { kind: "person", source: "chat" },
+        assignee: { botId: "bot", destination: { kind: "work_thread", threadId: "thread" } }, brief: "Review", level: "ask", delegation: "deny" } }) });
+    const host = fakeHost();
+    const coordinator = new RuntimeCoordinator({ dataDir: dir, host, persistentGoals: service.coordinatorHooks });
+    let hostError: unknown;
+    host.run = async node => {
+      try {
+        const call = (name: string, input: unknown) => service.callToolForTurn(node.id, node.botId, node.threadId, name, input);
+        if (node.id === "work-root") {
+          writeFileSync(join(workspace, "result.txt"), "actual result");
+          expect(service.roleForTurn(node.id, node.botId, node.threadId)).toBe("work");
+          expect(service.roleForTurn(node.id, "other", node.threadId)).toBeUndefined();
+          await expect(call("submit_goal_plan", {})).rejects.toThrow(/not authorized/);
+          await expect(call("goal_context", { goalId: "other" })).rejects.toThrow();
+          const snapshot = await call("goal_context", {}) as { version: number };
+          const artifact = await call("register_goal_artifact", { commandId: "artifact", expectedVersion: snapshot.version,
+            logicalName: "result", reference: "result.txt" }) as { version: number; artifactId: string };
+          await call("submit_goal_task_result", { commandId: "result", expectedVersion: artifact.version, requirementRevision: 1, planRevision: 1,
+            artifactIds: [artifact.artifactId], claims: [{ criterionId: "criterion", verdict: "met", note: "Created" }], knownIssues: [] });
+        } else if (node.id === "review-root") {
+          expect(service.roleForTurn(node.id, node.botId, node.threadId)).toBe("review");
+          const snapshot = await call("goal_context", {}) as { version: number };
+          await call("submit_goal_review", { commandId: "review", expectedVersion: snapshot.version,
+            verdicts: [{ criterionId: "criterion", verdict: "pass", reason: "The actual file satisfies the criterion." }] });
+        }
+        return { ok: true, text: "done" };
+      } catch (error) { hostError = error; return { ok: false, text: "test host failed" }; }
+    };
+    try {
+      service.goals.scopes.createArea({ id: "area", ownerId: "owner", name: "Research" });
+      service.goals.scopes.createWorkstream({ id: "stream", ownerId: "owner", areaId: "area", kind: "ongoing", name: "Brief" });
+      service.goals.scopes.setGlobalBudget({ ownerId: "owner", limit: 4 });
+      service.goals.scopes.setPeriodBudget({ ownerId: "owner", workstreamId: "stream", periodKey: "week", limit: 4 });
+      service.goals.createStandalone({ containerId: "container", ownerId: "owner", commandId: "create", workstreamId: "stream", leadThreadId: "thread",
+        executionLimit: 4, budgetPeriod: "week", routineId: "weekly", occurrenceKey: "week", task: { id: "task", title: "Brief", brief: "Write",
+          assigneeBotId: "bot", required: true, workspaceRef: "workspace", dependsOn: [],
+          criteria: [{ id: "criterion", description: "File", kind: "artifact_exists", required: true, config: { logicalName: "result" } }] } });
+      service.goals.prepareWork({ goalId: "container", ownerId: "owner", commandId: "work", taskId: "task", expectedVersion: 2,
+        intent: { goalId: "container", attemptId: "work", authorizationRef: "owner", request: { dispatchKey: "work-key", rootId: "work-root",
+          requesterRef: "work", origin: { kind: "person", source: "chat" }, assignee: { botId: "bot", destination: { kind: "work_thread", threadId: "thread" } },
+          brief: "Write", level: "ask" } } }, () => workspace);
+      service.start(coordinator);
+      for (let i = 0; i < 50 && service.goals.readStandalone("container", "owner")?.task.status !== "succeeded"; i++) {
+        await sleep(10); await service.tick();
+      }
+      if (hostError) throw hostError;
+      expect(service.goals.readStandalone("container", "owner")?.task.status).toBe("succeeded");
+      expect(service.goals.read("container", "owner")?.checks).toMatchObject([{ verdict: "pass" }]);
+      expect(service.budget.usage("container")).toEqual({ limit: 4, reserved: 2 });
+    } finally { await service.close(); coordinator.close(); await removeTempDir(dir); }
+  });
+
+  it("wires ownership, replay, authorization and budget to the actual coordinator", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "goal-host-service-"));
+    let allowed = false;
+    const service = createPersistentGoalHost({ dataDir: dir, isLocalDataDir: () => true, authorize: () => allowed ? true : "not authorized",
+      confirmStopped: () => false, log: () => {} });
+    const host = fakeHost();
+    const coordinator = new RuntimeCoordinator({ dataDir: dir, host, persistentGoals: service.coordinatorHooks });
+    try {
+      service.goals.create({ id: "g", ownerId: "owner", commandId: "create", title: "Goal", request: "Work", leadBotId: "lead", leadThreadId: "thread", executionLimit: 3 });
+      const intent = { goalId: "g", attemptId: "plan", authorizationRef: "owner", request: { dispatchKey: "key", rootId: "root", requesterRef: "plan",
+        origin: { kind: "person" as const, source: "chat" as const }, assignee: { botId: "lead", destination: { kind: "work_thread" as const, threadId: "thread" } },
+        brief: "Plan", level: "ask" as const, delegation: "deny" as const } };
+      service.goals.preparePlanning({ ownerId: "owner", goalId: "g", commandId: "plan", expectedVersion: 1, intent });
+      expect(service.coordinatorHooks.authorizeRoot({ ...intent.request, brief: "tampered" })).toMatch(/does not match/);
+      service.start(coordinator);
+      expect(coordinator.has("root")).toBe(false);
+      allowed = true;
+      await service.tick();
+      await flush();
+      await service.tick();
+      expect(host.runs).toHaveLength(1);
+      expect(service.budget.usage("g")).toEqual({ limit: 3, reserved: 1 });
+      expect(service.goals.read("g", "owner")).toMatchObject({ status: "blocked" });
+    } finally { await service.close(); coordinator.close(); await removeTempDir(dir); }
+  });
+});
+
 describe("view: an Assignment as the legacy node", () => {
   it("projects the plain fields: ids, address, key = bot, text = brief, times, counts", () => {
     expect(view(row({ startedAt: 1_500, executions: 2, restarts: 1, restart: "rerun", result: "half done", reportedAt: 3_000, approved: true, batchKey: "b1" }))).toEqual({
@@ -184,6 +274,124 @@ describe("needsInputQuestion", () => {
 });
 
 describe("RuntimeCoordinator: the requesting turn and its tree", () => {
+  it("runs a persisted goal through the coordinator only after scheduler recovery and authorization", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "coordinator-goal-"));
+    const goals = openGoalStore(join(dir, "goals.db"), { unsafeTestPlanBootstrap: true });
+    const budget = openExecutionBudgetStore(join(dir, "goals.db"));
+    const host = fakeHost(() => ({ ok: true, text: "finished" }));
+    const coordinator = new RuntimeCoordinator({ dataDir: dir, host, persistentGoals: {
+      authorizeRoot: req => req.requesterRef === "attempt" && req.origin.kind === "person" ? true : "not authorized",
+      admitExecution: (root, id, no) => budget.admit(root, id, no),
+    } });
+    const port = coordinator.persistentGoalRuntime();
+    const scheduler = createGoalScheduler({ goals, budget, runtime: port.runtime, runtimeStore: port.runtimeStore,
+      activateRuntime: port.activate, deactivateRuntime: port.deactivate, lockPath: join(dir, "owner.db"), authorize: () => true, log: () => {} });
+    try {
+      goals.create({ id: "g", ownerId: "owner", commandId: "create", title: "Goal", request: "Work", leadBotId: "lead", leadThreadId: "lead-thread", executionLimit: 2 });
+      goals.submitInitialPlanUnchecked({ goalId: "g", ownerId: "owner", commandId: "plan", expectedVersion: 1, requirementRevision: 1,
+        sourceAttemptId: "plan", reason: "initial", tasks: [{ id: "t", title: "Task", brief: "Work", assigneeBotId: "builder", required: true,
+          workspaceRef: "workspace", dependsOn: [], criteria: [{ id: "c", description: "Review", kind: "lead_review", required: true, config: {} }] }] });
+      goals.prepareWork({ goalId: "g", ownerId: "owner", commandId: "work", taskId: "t", expectedVersion: 2,
+        intent: { goalId: "g", attemptId: "attempt", authorizationRef: "owner", request: { dispatchKey: "key", rootId: "root", requesterRef: "attempt",
+          origin: { kind: "person", source: "chat" }, assignee: { botId: "builder", destination: { kind: "work_thread", threadId: "builder-work" } },
+          brief: "Work", level: "ask" } } }, ref => ref);
+      scheduler.start();
+      scheduler.tick();
+      await flush();
+      scheduler.tick();
+      expect(host.runs.map(run => run.node.id)).toEqual(["root"]);
+      expect(coordinator.node("root")).toMatchObject({ status: "completed", result: "finished" });
+      expect(goals.read("g", "owner")?.tasks[0]).toMatchObject({ status: "blocked", blocker: "incomplete_output" });
+      expect(budget.usage("g")).toEqual({ limit: 2, reserved: 1 });
+    } finally { scheduler.close(); coordinator.close(); budget.close(); goals.close(); await removeTempDir(dir); }
+  });
+
+  it("requires host authorization for a persistent root and resumes its typed question through the original runtime", async () => {
+    const request = { dispatchKey: "goal-key", rootId: "goal-root", requesterRef: "attempt",
+      origin: { kind: "person" as const, source: "chat" as const },
+      assignee: { botId: "chief", destination: { kind: "work_thread" as const, threadId: "goal-thread" } }, brief: "Work", level: "ask" as const };
+    const unconfigured = world();
+    expect(unconfigured.coordinator.enqueuePersistentGoal(request)).toMatchObject({ ok: false, reason: /not configured/ });
+    let allowed = false;
+    const admissions: number[] = [];
+    const host = fakeHost((_node, text) => text.includes("eu") ? { ok: true, text: "Done" } : { ok: true, text: "NEEDS INPUT: Which region?" });
+    const coordinator = new RuntimeCoordinator({ dataDir: ":memory:", host, persistentGoals: {
+      authorizeRoot: () => allowed ? true : "not authorized", admitExecution: (_root, _id, number) => { admissions.push(number); return true; },
+    } });
+    expect(coordinator.enqueuePersistentGoal(request)).toMatchObject({ ok: false, reason: "not authorized" });
+    expect(coordinator.all()).toEqual([]);
+    allowed = true;
+    expect(coordinator.enqueuePersistentGoal(request)).toMatchObject({ ok: true, duplicate: false });
+    expect(coordinator.enqueuePersistentGoal(request)).toMatchObject({ ok: true, duplicate: true });
+    coordinator.tick(); await flush();
+    expect(host.runs).toHaveLength(0);
+    const port = coordinator.persistentGoalRuntime();
+    port.activate();
+    coordinator.tick(); await flush();
+    expect(coordinator.node("goal-root")).toMatchObject({ status: "waiting", question: "Which region?" });
+    expect(host.parks).toHaveLength(1);
+    expect(coordinator.answerRoot("goal-root", "eu")).toBe(true);
+    coordinator.tick(); await flush();
+    expect(coordinator.node("goal-root")).toMatchObject({ status: "completed", result: "Done", executions: 2 });
+    expect(admissions).toEqual([1, 2]);
+    port.deactivate();
+    coordinator.close();
+    unconfigured.coordinator.close();
+  });
+
+  it("does not report a goal execution stopped until the host confirms it", async () => {
+    const host = fakeHost(() => "hold");
+    let confirmed = false;
+    const coordinator = new RuntimeCoordinator({ dataDir: ":memory:", host, persistentGoals: {
+      authorizeRoot: () => true, admitExecution: () => true, confirmStopped: () => confirmed,
+    } });
+    const port = coordinator.persistentGoalRuntime();
+    port.activate();
+    expect(port.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "root", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: { botId: "chief", destination: { kind: "work_thread", threadId: "goal-thread" } },
+      brief: "Work", level: "ask" }).ok).toBe(true);
+    port.runtime.tick();
+    expect(host.runs).toHaveLength(1);
+    expect(coordinator.node("root")?.status).toBe("running");
+    expect(port.runtime.cancelClientRoot("root")).toBe(false);
+    await flush();
+    expect(port.runtime.cancelClientRoot("root")).toBe(false);
+    confirmed = true;
+    expect(port.runtime.cancelClientRoot("root")).toBe(true);
+    coordinator.close();
+  });
+
+  it("uses ordinary teammate wakeups for client roots but refuses management delegation", async () => {
+    let coordinator: RuntimeCoordinator;
+    const host = fakeHost((node, _text) => {
+      if (node.id === "root" && node.executions === 1) {
+        coordinator.enqueue({ botId: "chief", threadId: "goal-thread" }, "root", undefined, builder, "Build it");
+        return { ok: true, text: "delegated" };
+      }
+      return { ok: true, text: node.id === "root" ? "synthesized" : "built" };
+    });
+    coordinator = new RuntimeCoordinator({ dataDir: ":memory:", host, persistentGoals: { authorizeRoot: () => true, admitExecution: () => true } });
+    const port = coordinator.persistentGoalRuntime();
+    port.activate();
+    const request = { dispatchKey: "key", rootId: "root", requesterRef: "attempt", origin: { kind: "person" as const, source: "chat" as const },
+      assignee: { botId: "chief", destination: { kind: "work_thread" as const, threadId: "goal-thread" } }, brief: "Work", level: "ask" as const };
+    expect(port.runtime.enqueueClientRoot(request).ok).toBe(true);
+    coordinator.tick(); await flush();
+    expect(coordinator.children("root")[0]).toMatchObject({ reply: "resume", status: "queued" });
+    coordinator.tick(); await flush();
+    coordinator.tick(); await flush();
+    expect(coordinator.node("root")).toMatchObject({ status: "completed", result: "synthesized", executions: 2 });
+    expect(host.runs.filter(run => run.node.id === "root")[1]?.text).toContain("built");
+
+    host.script = () => "hold";
+    expect(port.runtime.enqueueClientRoot({ ...request, dispatchKey: "plan-key", rootId: "plan", requesterRef: "plan-attempt", delegation: "deny" }).ok).toBe(true);
+    coordinator.tick();
+    expect(() => coordinator.enqueue({ botId: "chief", threadId: "goal-thread" }, "plan", undefined, builder, "Bypass"))
+      .toThrow(/cannot delegate/);
+    expect(coordinator.children("plan")).toEqual([]);
+    coordinator.close();
+  });
+
   it("creates the root under the generation, runs the child with the envelope, and resumes the root with the child's report", async () => {
     const w = world((node) => node.botId === "builder" ? { ok: true, text: "Built it on branch csv-export." } : undefined);
     w.host.levels.builder = { level: "edits", driverKind: "claudeAgent" };

@@ -30,6 +30,7 @@ export interface CatalogProfile {
   /** A room's thread: the widget and page tools, which rooms refuse, and the wait tools, since a room holds no wait,
    * are not mounted. */
   room?: boolean;
+  goalRole?: "plan" | "work" | "review";
 }
 
 /** Everything is off unless the harness says "1". */
@@ -49,5 +50,6 @@ export function catalogProfileFromEnv(env: NodeJS.ProcessEnv): CatalogProfile {
     mausbot: env.OMB_MAUSBOT === "1",
     computerSelection: env.OMB_COMPUTER_SELECTION === "1",
     room: env.OMB_ROOM === "1",
+    ...(["plan", "work", "review"].includes(env.OMB_GOAL_ROLE ?? "") ? { goalRole: env.OMB_GOAL_ROLE as "plan" | "work" | "review" } : {}),
   };
 }

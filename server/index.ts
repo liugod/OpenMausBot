@@ -22,6 +22,10 @@ import { cloudHomeLendingRefusal, createCloudRoutineAuthors, ownerOnlyConversati
 import { botMemoryFiles, createLendingMemory } from "./lending-memory.ts";
 import { SharedComputerControl } from "./shared-computer-control.ts";
 import { createCoordinator, type ComposedTurn, type CoordinateBotsCall, type Coordinator, type HandoffOpener, type HandoffOptions, type HandoffView, type HostTurnResult } from "./coordinator.ts";
+import { openGoalStore } from "./goals/goal-store.ts";
+import { createPersistentGoalHost } from "./goals/host-service.ts";
+import { createGoalWorkspaces, goalWorkspaceRef, parseGoalWorkspaceRef } from "./goals/workspace-refs.ts";
+import { createPersistentWorkRoutes } from "./routes/persistent-work.ts";
 import { queuedBehindPersonText, UnansweredApprovals } from "./waiting-on-person.ts";
 import { askToolName, createAskCards } from "./host/ask-cards.ts"; import { createQuestionRouting } from "./host/question-routing.ts"; import { workThreadFor } from "./host/work-thread.ts"; import { resumableCards as cardsWaitedOn } from "./host/resumable-cards.ts";
 import { assertRequestTarget, guardedRequestPath, requestConflict, requestNeedsInput } from "./guarded-requests.ts";
@@ -742,6 +746,67 @@ if (logins.onePasswordToken()) void onePassword.refresh();
 const botLogins = new BotLogins(logins, onePassword);
 const SESSION_COOKIE = sessionCookieName(PORT, ENVIRONMENT_ID);
 const HOSTED_WORKSPACE = hostedWorkspaceConfigured();
+const persistentWorkStore = process.env.OMB_PERSISTENT_WORK_PREVIEW === "1" && !CLOUD_HOME && !HOSTED_WORKSPACE
+  ? openGoalStore(join(DATA_DIR, "goals.db")) : null;
+if (persistentWorkStore) ROUTES.push(createPersistentWorkRoutes({ goals: persistentWorkStore,
+  ownerFor: auth => !sharedMembership() && auth.kind === "session" && ownerOrAdmin(auth) ? "local-owner" : undefined,
+  ...(process.env.OMB_TEST_SEALED_PATH === "1" && process.env.OMB_PERSISTENT_WORK_RUNTIME_TEST === "1" ? {
+    createChatTask: (ownerId, input) => {
+      if (!fixtureGoalHost || !fixtureGoalWorkspaces || ownerId !== "local-owner" || !store.bot(input.botId) ||
+        !store.taskByThread(input.botId, input.threadId)) throw new Error("task source is unavailable");
+      const scope = fixtureGoalHost.goals.scopes.ensureDefault(ownerId);
+      fixtureGoalHost.goals.scopes.ensureGlobalBudget({ ownerId, limit: input.executionLimit });
+      const hash = createHash("sha256").update(JSON.stringify([ownerId, input.commandId])).digest("hex");
+      const containerId = `item:${hash}`, taskId = `task:${hash}`, threadId = `goal-${hash}`, managementId = `management:${hash}`;
+      const cwd = fixtureGoalWorkspaces.ensure(goalWorkspaceRef(scope.workstreamId, managementId), scope.workstreamId, managementId);
+      const title = input.request.replace(/\s+/g, " ").slice(0, 100);
+      const thread = store.taskByThread(input.botId, threadId) ?? store.createTask(input.botId, title, false, undefined, undefined, "ask", undefined, cwd, threadId);
+      if (!thread || thread.cwd !== cwd || thread.approvalMode !== "ask") throw new Error("task review thread unavailable");
+      const created = fixtureGoalHost.goals.createStandalone({ containerId, ownerId, commandId: input.commandId,
+        workstreamId: scope.workstreamId, leadThreadId: threadId, sourceThreadId: input.threadId, executionLimit: input.executionLimit,
+        task: { id: taskId, title, brief: `${input.request}\n请将最终成果保存为 result.md，并登记为 result。`, assigneeBotId: input.botId,
+          required: true, workspaceRef: goalWorkspaceRef(scope.workstreamId, taskId), dependsOn: [], criteria: [
+            { id: "file", description: "已登记实际成果文件", required: true, kind: "artifact_exists", config: { logicalName: "result" } },
+            { id: "review", description: `成果符合用户要求：${input.request}`, required: true, kind: "lead_review", config: {} },
+          ] } });
+      return { itemId: containerId, version: created.version };
+    },
+    createItem: (ownerId, input) => {
+      if (!fixtureGoalHost || !fixtureGoalWorkspaces || ownerId !== "local-owner" || !store.bot(input.assigneeBotId)) throw new Error("item runtime unavailable");
+      const stream = fixtureGoalHost.goals.scopes.list(ownerId).workstreams.find(item => item.id === input.workstreamId && item.status === "active");
+      const budgets = fixtureGoalHost.goals.scopes.budgets(ownerId);
+      if (!stream || !budgets.global || (stream.kind === "ongoing" && (!input.budgetPeriod ||
+        !budgets.periods.some(item => item.workstreamId === input.workstreamId && item.periodKey === input.budgetPeriod)))) throw new Error("item scope or budget unavailable");
+      const hash = createHash("sha256").update(JSON.stringify([ownerId, input.commandId])).digest("hex");
+      const containerId = `item:${hash}`, taskId = `task:${hash}`, threadId = `goal-${hash}`, managementId = `management:${hash}`;
+      const cwd = fixtureGoalWorkspaces.ensure(goalWorkspaceRef(input.workstreamId, managementId), input.workstreamId, managementId);
+      const thread = store.taskByThread(input.assigneeBotId, threadId) ?? store.createTask(input.assigneeBotId, input.title, false, undefined, undefined, "ask", undefined, cwd, threadId);
+      if (!thread || thread.cwd !== cwd || thread.approvalMode !== "ask") throw new Error("item review thread unavailable");
+      const created = fixtureGoalHost.goals.createStandalone({ containerId, ownerId, commandId: input.commandId, workstreamId: input.workstreamId,
+        leadThreadId: threadId, executionLimit: input.executionLimit, ...(input.budgetPeriod ? { budgetPeriod: input.budgetPeriod } : {}),
+        task: { id: taskId, title: input.title, brief: input.brief, assigneeBotId: input.assigneeBotId, required: true,
+          workspaceRef: goalWorkspaceRef(input.workstreamId, taskId), criteria: input.criteria, dependsOn: [] } });
+      return { itemId: containerId, version: created.version };
+    },
+    createGoal: (ownerId, input) => {
+      if (!fixtureGoalHost || !fixtureGoalWorkspaces || ownerId !== "local-owner" || !store.bot(input.leadBotId)) throw new Error("goal runtime unavailable");
+      const stream = fixtureGoalHost.goals.scopes.list(ownerId).workstreams.find(item => item.id === input.workstreamId && item.status === "active");
+      if (!stream) throw new Error("workstream unavailable");
+      const hash = createHash("sha256").update(JSON.stringify([ownerId, input.commandId])).digest("hex");
+      const goalId = `goal:${hash}`, threadId = `goal-${hash}`, taskId = `management:${hash}`;
+      const cwd = fixtureGoalWorkspaces.ensure(goalWorkspaceRef(input.workstreamId, taskId), input.workstreamId, taskId);
+      const thread = store.taskByThread(input.leadBotId, threadId) ?? store.createTask(input.leadBotId, input.title, false, undefined, undefined, "ask", undefined, cwd, threadId);
+      if (!thread || thread.cwd !== cwd || thread.approvalMode !== "ask") throw new Error("goal thread unavailable");
+      const created = fixtureGoalHost.goals.create({ id: goalId, ownerId, commandId: input.commandId, title: input.title,
+        request: input.request, leadBotId: input.leadBotId, leadThreadId: threadId, executionLimit: input.executionLimit, workstreamId: input.workstreamId });
+      const attemptId = `goal-plan-${hash}`;
+      return fixtureGoalHost.goals.preparePlanning({ goalId, ownerId, commandId: `prepare:${input.commandId}`, expectedVersion: created.version,
+        intent: { goalId, attemptId, authorizationRef: ownerId, request: { dispatchKey: attemptId, rootId: attemptId, requesterRef: attemptId,
+          origin: { kind: "person", source: "chat" }, assignee: { botId: input.leadBotId, destination: { kind: "work_thread", threadId } },
+          brief: "Use goal_context to understand the goal. Create a concrete plan with submit_goal_plan. For each task obtain a workspace reference with goal_workspace_for_task, choose an available bot, and include testable acceptance criteria. Do not perform the task yourself.",
+          level: "ask", delegation: "deny" } } });
+    },
+  } : {}) }));
 let workspaceAccess: WorkspaceAccess | null = null;
 const DESKTOP_MANAGED = process.env.OMB_DESKTOP_PARENT === "1";
 const SHARED_WORKSPACE_FULL_ACCESS = sharedWorkspaceFullAccessConfigured();
@@ -1869,7 +1934,7 @@ function agentsIntegration(
   const host = { skillAuthoring: skillAuthoringEnabled(cfg), sharedComputers: lendingEnabled(), cloudHome: Boolean(CLOUD_HOME), team: Boolean(CLOUD_TEAM), escalations: chiefEscalationsEnabled(cfg),
     voiceNotes: tts.voiceReady(cfg, speaking?.voice) && speaking?.voiceNotes !== false, x: Boolean(researchCredential(cfg.treg?.key)), research: researchAvailability.available() };
   return { ...agentsProxyLaunch(), env: agentsServerEnv({ threadId, bot: bot ?? { id: botId }, room: Boolean(store.groupByThread(threadId)), teamComputer: Boolean(bot && inheritedTeamComputer(bot)), host },
-    { generation, depth, skillAuthoring, roomHandoffId, ...(hostFiles && !CLOUD_HOME && !HOSTED_WORKSPACE ? { deliversSavedFiles: true } : {}) },
+    { generation, depth, skillAuthoring, roomHandoffId, ...(roomHandoffId && fixtureGoalHost?.roleForTurn(roomHandoffId, botId, threadId) ? { goalRole: fixtureGoalHost.roleForTurn(roomHandoffId, botId, threadId) } : {}), ...(hostFiles && !CLOUD_HOME && !HOSTED_WORKSPACE ? { deliversSavedFiles: true } : {}) },
     (turn) => mintInternalCapability({ botId, threadId, kind: "agents", createdBots: 0, openedThreads: 0, ...turn }), `http://127.0.0.1:${PORT}`) };
 }
 
@@ -3946,9 +4011,73 @@ const questionRouting = createQuestionRouting({ store, active: () => coordinator
   answerLive: async (threadId, requestId, text) => await answerRequest(threadId, botForThread(store.botByThread(threadId)?.id ?? "", threadId)?.modelSelection.instanceId ?? "", requestId, "answer", text) === "answered", settleSignIns: (node) => signInSettle.answeredElsewhere(node),
   keptPrivate: (node, requester) => keptPrivate({ child: teamHost.privateTo(node.threadId), parent: teamHost.privateTo(requester.threadId) }),
   steer: async (threadId, text) => canSteerThread(threadId) && (await steerThread(threadId, text)) !== "refused" });
+// This bridge is deliberately confined to the sealed verification server until the
+// user-facing creation flow, isolation and stop reconciliation have been validated.
+const fixtureGoalRuntimeEnabled = Boolean(persistentWorkStore) && process.env.OMB_TEST_SEALED_PATH === "1" &&
+  process.env.OMB_PERSISTENT_WORK_RUNTIME_TEST === "1";
+const fixtureGoalWorkspaces = fixtureGoalRuntimeEnabled ? createGoalWorkspaces(DATA_DIR) : undefined;
+const fixtureGoalHost: ReturnType<typeof createPersistentGoalHost> | undefined = fixtureGoalRuntimeEnabled ? createPersistentGoalHost({
+  dataDir: DATA_DIR,
+  isLocalDataDir: () => true,
+  authorize: intent => {
+    const request = intent.request;
+    if (intent.authorizationRef !== "local-owner" || !fixtureGoalHost?.goals.read(intent.goalId, "local-owner") ||
+      request.origin.kind !== "person" || request.level !== "ask" || request.delegation !== "deny" ||
+      request.assignee.destination.kind !== "work_thread" ||
+      !store.taskByThread(request.assignee.botId, request.assignee.destination.threadId)) return "goal dispatch is not authorized";
+    return true;
+  },
+  confirmStopped: () => false,
+  isCurrentTurn: context => activeInternalGenerationByThread.has(context.threadId),
+  canAssignBot: (context, botId) => {
+    const sender = store.bot(context.botId);
+    return !!sender && (botId === sender.id || reachablePeers(store.bots, sender).some(bot => bot.id === botId));
+  },
+  canUseWorkspace: (context, reference) => {
+    try {
+      const workstreamId = fixtureGoalHost!.goals.planningContext(context, () => true).workstreamId;
+      return fixtureGoalWorkspaces!.allows(reference, workstreamId);
+    } catch { return false; }
+  },
+  resolveAuthorizedRoots: reference => {
+    const scope = parseGoalWorkspaceRef(reference);
+    return scope ? fixtureGoalWorkspaces!.existing(reference, scope.workstreamId, scope.taskId) : [];
+  },
+  prepareReadyWork: candidate => {
+    if (candidate.ownerId !== "local-owner" || !fixtureGoalWorkspaces!.allows(candidate.task.workspaceRef, candidate.workstreamId, candidate.task.id)) return undefined;
+    const cwd = fixtureGoalWorkspaces!.ensure(candidate.task.workspaceRef, candidate.workstreamId, candidate.task.id);
+    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, candidate.planRevision, candidate.task.id])).digest("hex");
+    const threadId = `goal-${hash}`;
+    const task = store.taskByThread(candidate.task.assigneeBotId, threadId) ??
+      store.createTask(candidate.task.assigneeBotId, candidate.task.title, false, undefined, undefined, "ask", undefined, cwd, threadId);
+    if (!task || task.cwd !== cwd || task.approvalMode !== "ask") return undefined;
+    const attemptId = `goal-work-${hash}`;
+    return { intent: { goalId: candidate.goalId, attemptId, authorizationRef: "local-owner", request: {
+      dispatchKey: attemptId, rootId: attemptId, requesterRef: attemptId, origin: { kind: "person", source: "chat" },
+      assignee: { botId: candidate.task.assigneeBotId, destination: { kind: "work_thread", threadId } },
+      brief: `Use goal_context to read your assigned task and its acceptance criteria. Read dependency inputs with list_goal_inputs and read_goal_input if present. Work only in the current directory. Register actual output files with register_goal_artifact, then submit_goal_task_result with honest claims for each criterion. Task: ${candidate.task.brief}`,
+      level: "ask", delegation: "deny" } }, resolveWritableWorkspace: reference => {
+        if (reference !== candidate.task.workspaceRef) throw new Error("unexpected task workspace");
+        return cwd;
+      } };
+  },
+  prepareReadyReview: candidate => {
+    const goal = fixtureGoalHost!.goals.read(candidate.goalId, candidate.ownerId);
+    if (!goal || candidate.ownerId !== "local-owner") return undefined;
+    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, goal.planRevision, candidate.taskId])).digest("hex");
+    const attemptId = `goal-review-${hash}`;
+    return { goalId: candidate.goalId, attemptId, authorizationRef: "local-owner", request: {
+      dispatchKey: attemptId, rootId: attemptId, requesterRef: attemptId, origin: { kind: "person", source: "chat" },
+      assignee: { botId: goal.leadBotId, destination: { kind: "work_thread", threadId: goal.leadThreadId } },
+      brief: "Use goal_context and read_goal_review_artifact to inspect the task and actual evidence, then call submit_goal_review with an honest verdict for every criterion. Do not claim you inspected evidence that is unavailable.",
+      level: "ask", delegation: "deny" } };
+  },
+  log: message => console.error("persistent goals:", message),
+}) : undefined;
 const coordinator: Coordinator = createCoordinator({
   dataDir: DATA_DIR,
   now: Date.now,
+  ...(fixtureGoalHost ? { persistentGoals: fixtureGoalHost.coordinatorHooks } : {}),
   log: line => console.error("coordinator:", line),
   legacyThreads: {
     standingThreadOf: botId => botMainThread(botId) ?? store.bot(botId)?.threadId,
@@ -7898,11 +8027,13 @@ async function startTurn(
 
   void (async () => {
     try {
+
       const engineRead = registry.engineRead(instance.instanceId);
       if (engineRead) {
         await engineRead;
         if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) throw new DirectTurnSetupCancelled("turn stopped while the engine was read");
       }
+
       if (opts?.runOn === "cloud") {
         const readiness = await cloudRoutineReadiness(botId, threadId);
         if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) {
@@ -7925,6 +8056,7 @@ async function startTurn(
         drainQueuedSends();
         return;
       }
+
       const skipTranscript = new Set<string>([userMessage.id, ...(opts?.excludeMessageIds ?? [])]);
       const activeMessages = store.activePath(threadId);
       const coordinationChildren = opts?.coordination?.resumed
@@ -8478,6 +8610,7 @@ async function startTurn(
         coordinationNode.parentId ? coordinator.node(coordinationNode.parentId) : undefined))) {
         throw new DirectTurnSetupCancelled("Coordination access changed before dispatch");
       }
+
       // The tool bridge is decided here: the folder the turn is launched in is known, and the prompt is not built yet.
       applyAgentsBridge(threadId, integrations, cfg, bot, turnEngine(instance, providerConfigs(), registry.lastSnapshot(instance.instanceId), cwd));
       const confined = proactive.fence.confines(threadId); if (confined) for (const key of Object.keys(integrations) as Array<keyof typeof integrations>) if (!READ_AND_DRAFT_TOOLS.has(key)) delete integrations[key];
@@ -8552,6 +8685,7 @@ async function startTurn(
       const startupRecovery = (opts?.automaticRecoveryIndex ?? 0) < startupBackups(liveBot ?? bot, cfg.automaticRecovery).length;
       const held = limitTakeover.heldAtStart(bot, { instanceId, model }, startupRecovery); // a limit or a sign-out already known: straight to an AI that can carry on, with the reset only when one was named
       if (held) throw held.scope === "signed-out" ? new TurnAuthenticationRefusedError(`signed-out-${randomUUID()}`, `${engineName(instanceId)} is signed out.`, true) : new TurnUsageLimitRefusedError(`limit-${randomUUID()}`, `${engineName(instanceId)} is at its usage limit.`, held.resetsAt, held.scope, true);
+
       const dispatch = await guardTurnDispatch(shareNote.after(savedSteps.dispatch.sendTurn(instance, personLine && !opts?.unattended && !opts?.app?.context && !guestConfined ? { botId: bot.id, message: userMessage, turnText: text, placePicked: wants === "local" && placeSource !== "auto-pin" } : null, {
         threadId,
         botId: bot.id,
@@ -13152,6 +13286,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         return body;
       };
+      const goalTool = /^\/api\/internal\/persistent-goals\/([a-z_]+)$/.exec(path);
+      if (goalTool) {
+        if (method !== "POST") return json(res, 405, { error: "method not allowed" });
+        if (!fixtureGoalHost || !internalCapability.roomHandoffId) return json(res, 403, { error: "goal tool unavailable" });
+        const input = await readInternalBody();
+        try {
+          return json(res, 200, await fixtureGoalHost.callToolForTurn(internalCapability.roomHandoffId,
+            internalSender.id, internalCapability.threadId, goalTool[1]!, input));
+        } catch { return json(res, 403, { error: "goal tool request rejected" }); }
+      }
       const requireActiveInternalCapability = () => {
         if (!internalCapabilityIsActive(internalCapability)) {
           throw Object.assign(new Error("the internal turn capability has expired"), { status: 401 });
@@ -15675,6 +15819,7 @@ server.listen(PORT, "127.0.0.1", async () => {
     if (companyShutdown) return;
   }
   // Only once every registry is initialized and the endpoint listens: earlier dispatch can hit uninitialized bindings.
+  fixtureGoalHost?.start(coordinator);
   moveFreeze.hold(() => { routines!.start(); botWaits.start(); proactive.start(); }, () => { routines!.stop(); botWaits.stop(); proactive.stop(); });
   limitClock.start();
   moveFreeze.hold(() => memoryUpkeep.start(), () => memoryUpkeep.stop());
@@ -15736,6 +15881,7 @@ const gracefulShutdown = createGracefulShutdown({
       cloudComputerPower.close();
       vps.closeAllVpsDesktopTunnels();
       watchdog.stop();
+      persistentWorkStore?.close();
       routines?.close(); void appTriggers.stop();
       calendarCalls?.stop(); botWaits.stop();
       memoryUpkeep.stop();
@@ -15744,6 +15890,7 @@ const gracefulShutdown = createGracefulShutdown({
       webhookIngress?.server.close();
       tunnelListener?.close(); stopCloudHomeConnectedApps();
     },
+    async () => { await fixtureGoalHost?.close(); },
     async () => { await managedDesktop.close(); await registry.disposeAll(); },
     async () => { await dataEngine.closeAll().catch((error) => console.warn("data: close failed", error)); },
     async () => {

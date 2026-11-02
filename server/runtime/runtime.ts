@@ -1,5 +1,5 @@
 // The store is the only state: tick() is the only place work is admitted or dispatched, and no timer lives here.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { composeEnvelope } from "./envelope.ts";
 import { assignmentLevel } from "./level.ts";
@@ -16,6 +16,8 @@ export interface RuntimeOptions {
   limits?: Partial<Limits>;
   level?: typeof assignmentLevel;
   log?: (line: string) => void;
+  /** Persist an idempotent reservation for (assignmentId, executionNo); false or a throw must leave the turn unstarted. */
+  admitClientExecution?: (rootId: string, assignmentId: string, executionNo: number) => boolean;
 }
 
 export interface BeginRequest {
@@ -32,6 +34,18 @@ export interface BeginRequest {
   /** Default "resume"; external runtimes use "poll". */
   reply?: Reply;
   goalRunId?: string;
+}
+
+export interface ClientRootRequest {
+  dispatchKey: string;
+  rootId: string;
+  requesterRef: string;
+  origin: Origin;
+  assignee: Assignee;
+  brief: string;
+  doneWhen?: string;
+  level: Level;
+  delegation?: "allow" | "deny";
 }
 
 const BRIEF_MAX = 12_000;
@@ -53,11 +67,14 @@ export class Runtime {
   private readonly clock: Clock;
   private readonly level: typeof assignmentLevel;
   private readonly log: (line: string) => void;
+  private readonly admitClientExecution: RuntimeOptions["admitClientExecution"];
   private readonly bootAt: number;
   private opened = false;
   private closing = false;
   private ticking = false;
   private readonly turns = new Map<string, LiveTurn>();
+  private readonly unsettledTurns = new Set<LiveTurn>();
+  private readonly ownedClientStops = new Set<string>();
   private readonly rootActivity = new Map<string, number>();
   private readonly admissionNoted = new Set<string>();
   private readonly reportDue = new Set<string>();
@@ -71,6 +88,7 @@ export class Runtime {
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
     this.level = options.level ?? assignmentLevel;
     this.log = options.log ?? (line => console.error("runtime:", line));
+    this.admitClientExecution = options.admitClientExecution;
     this.bootAt = this.clock.now();
   }
 
@@ -82,6 +100,9 @@ export class Runtime {
     // Deepest first: a child's fate marks its parent before the parent's own turn is judged.
     const live = this.store.all({ nonTerminal: true }).sort((a, b) => b.depth - a.depth);
     this.withBatch(() => {
+      for (const rootId of new Set(live.filter(n => n.status === "running" && this.store.isClientRoot(n.rootId)).map(n => n.rootId))) {
+        this.store.holdClientRoot(rootId, now);
+      }
       for (const snapshot of live) {
         const n = this.store.get(snapshot.id);
         if (!n || isTerminal(n)) continue;
@@ -89,6 +110,15 @@ export class Runtime {
           this.store.update(n, { kind: "restart_reconciled", at: now, detail: "needs_input: parked again" });
           this.touch(n);
           this.safe("park", () => this.runner.park(n, n.question ?? "", true));
+          continue;
+        }
+        if (this.store.clientRootHeld(n.rootId)) {
+          if (n.status === "running") {
+            n.status = "waiting";
+            n.lastActivityAt = now;
+            this.store.update(n, { kind: "restart_reconciled", at: now, detail: "waiting: interrupted execution needs reconciliation" });
+            this.touch(n);
+          }
           continue;
         }
         if (n.status !== "running") continue;
@@ -170,6 +200,45 @@ export class Runtime {
     return this.store.prune(before);
   }
 
+  /** Internal only: the host must authorize the requester and resolve its level before calling. */
+  enqueueClientRoot(req: ClientRootRequest): EnqueueResult {
+    const refuse = (reason: string): EnqueueResult => ({ ok: false, reason, outcome: "refused" });
+    if (!req.dispatchKey || !req.rootId || !req.requesterRef || !req.brief || req.brief.length > BRIEF_MAX) return refuse("Invalid client root request");
+    const payload = {
+      rootId: req.rootId, requesterRef: req.requesterRef,
+      origin: { kind: req.origin.kind, source: req.origin.source, ref: req.origin.ref ?? null,
+        quote: req.origin.quote ?? null, onBehalfOf: req.origin.onBehalfOf ?? null },
+      assignee: { botId: req.assignee.botId, kind: req.assignee.destination.kind,
+        threadId: req.assignee.destination.threadId, groupId: req.assignee.destination.groupId ?? null },
+      brief: req.brief, doneWhen: req.doneWhen ?? null, level: req.level, delegation: req.delegation ?? "allow",
+    };
+    const hash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    try {
+      const existing = this.store.clientRequest(req.dispatchKey);
+      if (existing) return existing.hash === hash
+        ? { ok: true, assignment: existing.assignment, duplicate: true }
+        : refuse("Client dispatch key conflict");
+      const now = this.clock.now();
+      const node: Assignment = {
+        id: req.rootId, rootId: req.rootId, depth: 0, origin: req.origin,
+        requester: { kind: "external_runtime", runId: req.requesterRef }, assignee: req.assignee,
+        mode: "work", reply: "poll", brief: req.brief, ...(req.doneWhen ? { doneWhen: req.doneWhen } : {}),
+        status: "queued", level: req.level, levelSource: "own", executions: 0, restarts: 0,
+        createdAt: now, lastActivityAt: now, result: "", rework: false,
+        budgets: { since: now, requests: 0, executions: 0, wakes: 0 }, version: 1,
+      };
+      const problem = this.safe("validate", () => this.runner.validate(node));
+      if (this.lastThrew) return refuse("The host could not validate the request now");
+      if (problem) return refuse(problem);
+      const result = this.store.insertClientRoot(req.dispatchKey, hash, node, req.delegation ?? "allow");
+      if (!result.duplicate) this.touch(result.assignment);
+      return { ok: true, ...result };
+    } catch (error) {
+      this.log(`enqueueClientRoot failed: ${String(error)}`);
+      return refuse("The client request could not be recorded");
+    }
+  }
+
   /** Hand work to a teammate from a running node. Never throws. */
   enqueue(req: EnqueueRequest): EnqueueResult {
     try {
@@ -186,6 +255,7 @@ export class Runtime {
     const parent = req.parentId ? this.store.get(req.parentId) : undefined;
     if (req.parentId && !parent) return refuse("The requesting turn no longer exists");
     if (parent && parent.status !== "running") return refuse("The requesting turn is not running");
+    if (parent && this.store.clientRootDeniesDelegation(parent.rootId)) return refuse("This goal management run cannot delegate work directly");
     const brief = clip(req.brief, BRIEF_MAX);
     const mode = req.mode ?? "work";
     const lineage = parent ? path(this.store, parent) : [];
@@ -248,7 +318,8 @@ export class Runtime {
     for (const snapshot of [...live].sort((a, b) => b.depth - a.depth)) {
       const n = this.store.get(snapshot.id);
       if (!n || isTerminal(n)) continue;
-      if (n.status === "queued" && !n.continuation && now - this.since(n.lastActivityAt) > this.limits.queueMs) {
+      if (this.store.clientRootHeld(n.rootId)) continue;
+      if (n.status === "queued" && !n.continuation && !this.store.isClientRoot(n.rootId) && now - this.since(n.lastActivityAt) > this.limits.queueMs) {
         this.cancelTree(n, n.executions > 0 ? "not resumed" : "never started", "failed", "expired");
       } else if (n.status === "needs_input" && this.inputExpires(n) && now - this.since(n.lastActivityAt) > this.limits.inputWaitMs) {
         this.cancelTree(n, "the person did not answer", "failed", "expired");
@@ -263,6 +334,7 @@ export class Runtime {
     for (const snapshot of [...live].sort((a, b) => b.depth - a.depth)) {
       const n = this.store.get(snapshot.id);
       if (!n || isTerminal(n)) continue;
+      if (this.store.clientRootHeld(n.rootId)) continue;
       const parent = n.parentId ? this.store.get(n.parentId) : undefined;
       const problem = this.safe("validate", () => this.runner.validate(n, parent));
       if (this.lastThrew || !problem) continue;
@@ -271,6 +343,7 @@ export class Runtime {
     for (const rootId of new Set(live.map(n => n.rootId))) {
       const root = this.store.get(rootId);
       if (!root || isTerminal(root)) continue;
+      if (this.store.isClientRoot(root.id)) continue;
       const anchor = Math.max(this.since(root.lastActivityAt), this.rootActivity.get(rootId) ?? 0);
       if (now - anchor <= this.limits.stallMs) continue;
       const tree = this.store.all({ rootId });
@@ -287,9 +360,10 @@ export class Runtime {
       if (snapshot.status !== "waiting") continue;
       const n = this.store.get(snapshot.id);
       if (!n || n.status !== "waiting") continue;
+      if (this.store.clientRootHeld(n.rootId)) continue;
       const due = this.resumeReason(n);
       if (!due) continue;
-      if (due === "settled" && !n.parentId && n.reply === "poll") {
+      if (due === "settled" && !n.parentId && n.reply === "poll" && !this.store.isClientRoot(n.id)) {
         this.settle(n, "completed", "done");
       } else {
         n.status = "resume";
@@ -307,6 +381,7 @@ export class Runtime {
       if (snapshot.status !== "queued" && snapshot.status !== "resume") continue;
       const n = this.store.get(snapshot.id);
       if (!n || (n.status !== "queued" && n.status !== "resume")) continue;
+      if (this.store.clientRootHeld(n.rootId)) continue;
       if (n.status === "resume" && n.restart !== "rerun" && !this.resumeReason(n)) {
         n.status = "waiting";
         this.store.update(n, { kind: "waiting", at: this.clock.now(), detail: "waiting: nothing left to resume for" });
@@ -338,6 +413,10 @@ export class Runtime {
           this.touch(n);
         }
         continue;
+      }
+      if (this.store.isClientRoot(n.rootId)) {
+        const admitted = this.safe("admitClientExecution", () => this.admitClientExecution?.(n.rootId, n.id, n.executions + 1));
+        if (admitted !== true) continue;
       }
       if (this.dispatch(n, parent, resumed)) busyThreads.add(thread);
     }
@@ -404,6 +483,7 @@ export class Runtime {
     const controller = new AbortController();
     const live: LiveTurn = { controller, rootId: root.id, activeAt: this.clock.monotonic(), interruption, carried };
     this.turns.set(n.id, live);
+    this.unsettledTurns.add(live);
     this.rootActivity.set(root.id, now);
     let turn: Promise<RunResult>;
     try {
@@ -417,7 +497,10 @@ export class Runtime {
         this.log(`run(${n.id}) threw: ${String(error)}`);
         this.turnEnded(n.id, live, { kind: "failed", outcome: "provider_error", text: clip(String(error), 1000) });
       },
-    ).finally(() => { if (this.turns.get(n.id) === live) this.turns.delete(n.id); });
+    ).finally(() => {
+      this.unsettledTurns.delete(live);
+      if (this.turns.get(n.id) === live) this.turns.delete(n.id);
+    });
     return true;
   }
 
@@ -539,6 +622,38 @@ export class Runtime {
     const n = this.store.get(id);
     if (!n) return;
     this.withBatch(() => outcome === "failed" ? this.cancelTree(n, reason, "failed", "interrupted") : this.cancelTree(n, reason, "cancelled", "stopped"));
+  }
+
+  cancelClientRoot(id: string): boolean {
+    if (!this.store.isClientRoot(id)) throw new Error("not a client root");
+    if ([...this.unsettledTurns].some(turn => turn.rootId === id) && !this.store.clientStopPending(id)) {
+      this.store.markClientStopPending(id);
+      this.ownedClientStops.add(id);
+    }
+    this.cancel(id, "Goal cancelled");
+    const unsettled = [...this.unsettledTurns].some(turn => turn.rootId === id);
+    const root = this.store.get(id);
+    if (!root) throw new Error("client root record missing");
+    if (!unsettled && this.ownedClientStops.has(id) && isTerminal(root)) {
+      this.store.clearClientStopPending(id);
+      this.ownedClientStops.delete(id);
+    }
+    return !unsettled && !this.store.clientRootHeld(id) && !this.store.clientStopPending(id);
+  }
+
+  confirmClientRootStopped(id: string, verifyStopped: () => boolean): boolean {
+    if (!this.store.isClientRoot(id)) throw new Error("not a client root");
+    const root = this.store.get(id);
+    if (!root || !isTerminal(root) || this.store.all({ rootId: id, nonTerminal: true }).length > 0 ||
+      [...this.unsettledTurns].some(turn => turn.rootId === id)) return false;
+    if (verifyStopped() !== true) return false;
+    this.store.transaction(() => {
+      this.store.clearClientHold(id);
+      this.store.clearClientStopPending(id);
+      this.store.update(root, { kind: "restart_reconciled", at: this.clock.now(), detail: "stopped: host confirmation recorded" });
+    });
+    this.ownedClientStops.delete(id);
+    return true;
   }
 
   /** The person stopped the requester's conversation: work that never started is dropped, a teammate
@@ -698,7 +813,7 @@ export class Runtime {
     const kids = awaited(this.store.children(n.id));
     if (kids.length === 0) return undefined;
     if (kids.every(c => isTerminal(c) && c.reportedAt !== undefined)) return "settled";
-    if (!n.parentId && n.reply === "poll") return undefined;
+    if (!n.parentId && n.reply === "poll" && !this.store.isClientRoot(n.id)) return undefined;
     const parked = new Set(kids.filter(asking).map(c => c.id));
     if (parked.size === 0) return undefined;
     const items = this.store.inbox({ threadId: n.assignee.destination.threadId }, true);
@@ -712,7 +827,8 @@ export class Runtime {
   /** Whether its requester takes a turn for its question: a one-way notice's never does, nor a `poll` root. */
   private decidable(n: Assignment): boolean {
     const parent = n.parentId ? this.store.get(n.parentId) : undefined;
-    return n.reply !== "none" && parent !== undefined && !isTerminal(parent) && !(!parent.parentId && parent.reply === "poll");
+    return n.reply !== "none" && parent !== undefined && !isTerminal(parent) &&
+      !(!parent.parentId && parent.reply === "poll" && !this.store.isClientRoot(parent.id));
   }
 
   private decideDefault(n: Assignment): void {

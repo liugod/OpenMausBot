@@ -78,6 +78,16 @@ await build({
   banner: NODE_REQUIRE,
 });
 
+// Goal schema checks run in a resource-limited worker without node_modules.
+await build({
+  entryPoints: [join(server, "goals", "json-check.worker.mjs")],
+  bundle: true,
+  platform: "node",
+  target: "node20",
+  format: "cjs",
+  outfile: join(root, "dist-server", "goals", "json-check.worker.cjs"),
+});
+
 // External MCP clients launch this as an independent stdio process, so release
 // users need no repository, TypeScript, pnpm or node_modules.
 await build({

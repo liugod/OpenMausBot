@@ -40,3 +40,6 @@ deploy/podman/.env
 deploy/podman/.env.*
 !deploy/podman/.env.example
 /.env
+
+# Local persistent goal trial data (includes sign-in credentials).
+/.persistent-work-trial/

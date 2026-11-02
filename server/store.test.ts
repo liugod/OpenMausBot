@@ -33,6 +33,19 @@ describe("Store", () => {
     rmSync(DATA_DIR, { recursive: true, force: true });
   });
 
+  it("creates a stable goal thread only once and never reuses another thread's id", () => {
+    const store = new Store(selection);
+    const first = store.createBot({ name: "First" });
+    const second = store.createBot({ name: "Second" });
+    const threadId = `goal-${"a".repeat(64)}`;
+    const task = store.createTask(first.id, "Goal task", false, undefined, undefined, "ask", undefined, undefined, threadId);
+    expect(task?.threadId).toBe(threadId);
+    expect(store.createTask(first.id, "Duplicate", false, undefined, undefined, "ask", undefined, undefined, threadId)).toBeNull();
+    expect(store.createTask(second.id, "Collision", false, undefined, undefined, "ask", undefined, undefined, threadId)).toBeNull();
+    expect(store.createTask(first.id, "Invalid", false, undefined, undefined, "ask", undefined, undefined, "not-a-goal-id")).toBeNull();
+    expect(new Store(selection).taskByThread(first.id, threadId)?.title).toBe("Goal task");
+  });
+
   it("retains tool selection across restarts and distinguishes clearing from no tools", () => {
     const store = new Store(selection);
     const bot = store.createBot({ name: "Scoped drafter" });

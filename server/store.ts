@@ -2188,11 +2188,13 @@ export class Store {
   }
 
   createTask(botId: string, title?: string, activate = true, projectId?: string, openedBy?: TaskOpenedBy, approvalMode?: "ask" | "full",
-    modelSelection?: ModelSelection, cwd?: string): TaskRecord | null {
+    modelSelection?: ModelSelection, cwd?: string, stableGoalThreadId?: string): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
     if (projectId !== undefined && !this.project(botId, projectId)) return null;
-    const task = this.buildTask(bot, title, projectId, openedBy, approvalMode, modelSelection, cwd);
+    if (stableGoalThreadId !== undefined && (!/^goal-[a-f0-9]{64}$/.test(stableGoalThreadId) ||
+      this.botByThread(stableGoalThreadId) || this.groupByThread(stableGoalThreadId))) return null;
+    const task = this.buildTask(bot, title, projectId, openedBy, approvalMode, modelSelection, cwd, stableGoalThreadId);
     this.commitBotChange(bot, "the new thread", () => {
       bot.tasks = [task, ...(bot.tasks ?? [])];
       if (activate) this.mirrorActiveTask(bot, task);
@@ -2202,10 +2204,10 @@ export class Store {
   }
 
   private buildTask(bot: BotRecord, title?: string, projectId?: string, openedBy?: TaskOpenedBy, approvalMode?: "ask" | "full",
-    modelSelection?: ModelSelection, cwd?: string): TaskRecord {
+    modelSelection?: ModelSelection, cwd?: string, stableGoalThreadId?: string): TaskRecord {
     const createdAt = Date.now();
     return {
-      threadId: newId(),
+      threadId: stableGoalThreadId ?? newId(),
       title: threadTitleFrom(title),
       createdAt,
       updatedAt: createdAt,

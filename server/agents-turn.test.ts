@@ -82,6 +82,14 @@ describe("one conversation's agents tools", () => {
 });
 
 describe("what a turn that may not use a listed tool is told", () => {
+  it("passes an explicitly assigned goal role to the agents proxy", async () => {
+    const env = agentsServerEnv(CHAT, { generation: "goal-work", depth: 0, skillAuthoring: false, goalRole: "work" }, bearer, "http://127.0.0.1:9");
+    expect(env.OMB_GOAL_ROLE).toBe("work");
+    const names = (JSON.parse(await toolsList(env)) as { tools: Array<{ name: string }> }).tools.map(tool => tool.name);
+    expect(names).toContain("submit_goal_task_result");
+    expect(names).not.toContain("submit_goal_plan");
+  });
+
   it("names what started a direct turn", () => {
     expect(directTurnKind({})).toBe("person");
     expect(directTurnKind({ automationSource: "schedule" })).toBe("routine");

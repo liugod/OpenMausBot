@@ -30,6 +30,43 @@ const open = (path = ":memory:") => { const s = openRuntimeStore(path); stores.p
 afterEach(() => { for (const s of stores.splice(0)) s.close(); });
 
 describe("runtime store", () => {
+  it("atomically deduplicates client roots and retains their trees during pruning", () => {
+    const store = open();
+    const root = assignment("client-root", { requester: { kind: "external_runtime", runId: "attempt" }, reply: "poll" });
+    expect(store.insertClientRoot("dispatch", "hash", root)).toEqual({ assignment: root, duplicate: false });
+    expect(store.insertClientRoot("dispatch", "hash", { ...root, id: "other", rootId: "other" }))
+      .toEqual({ assignment: root, duplicate: true });
+    expect(() => store.insertClientRoot("dispatch", "different", root)).toThrow(/conflict/);
+    expect(() => store.insertClientRoot("other-key", "hash", root)).toThrow();
+    expect(store.clientRoot("other-key")).toBeUndefined();
+    expect(store.events(root.id).map(e => e.kind)).toEqual(["enqueued"]);
+    store.update({ ...root, status: "completed", outcome: "done", finishedAt: 10 });
+    const page = store.transitions(0, 1);
+    expect(page).toHaveLength(1);
+    expect(page[0]?.assignmentId).toBe(root.id);
+    expect(store.transitions(page[0]!.id, 1)).toEqual([]);
+    expect(() => store.transitions(0, 1001)).toThrow(/invalid/);
+    expect(store.prune(100)).toBe(0);
+    expect(store.clientRoot("dispatch")?.status).toBe("completed");
+  });
+
+  it("recovers the original client root after reopening the database", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runtime-client-root-"));
+    try {
+      const path = join(dir, "runtime.db");
+      const root = assignment("root", { requester: { kind: "external_runtime", runId: "attempt" }, reply: "poll" });
+      const first = openRuntimeStore(path);
+      first.insertClientRoot("key", "hash", root);
+      first.close();
+      const reopened = openRuntimeStore(path);
+      try {
+        expect(reopened.insertClientRoot("key", "hash", { ...root, id: "new", rootId: "new" }))
+          .toEqual({ assignment: root, duplicate: true });
+        expect(reopened.all()).toHaveLength(1);
+      } finally { reopened.close(); }
+    } finally { await removeTempDir(dir); }
+  });
+
   it("round-trips a row with its event, and reads children in createdAt order", () => {
     const store = open();
     const root = assignment("root", { status: "running", startedAt: 1_000, budgets: { since: 1_000, requests: 0, executions: 1, wakes: 0 } });

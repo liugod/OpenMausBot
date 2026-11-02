@@ -3,13 +3,14 @@ import { join } from "node:path";
 import type { BeginTurnRequest, Coordinator, CoordinatorHost, CoordinatorOptions, HandoffOptions, HandoffView, HostTurnResult, LiveHandoffEdge, RoomAddress } from "./coordinator.ts";
 import type { WorkOrigin } from "./peer-provenance.ts";
 import { composeEnvelope, composeQuestion, composeReport, composeResume, composeRootTurn, continuationLine, envelopeNote } from "./runtime/envelope.ts";
-import { Runtime } from "./runtime/runtime.ts";
+import { Runtime, type ClientRootRequest } from "./runtime/runtime.ts";
 import { importLegacyDelegations, importLegacyHandoffs, type LegacyThreadResolver } from "./runtime/import-legacy.ts";
 import { openRuntimeStore, type RuntimeStore } from "./runtime/store.ts";
 import { personOnly, requesterDecides, withDefault } from "./runtime/questions.ts";
 import { childrenSince, clip, isTerminal, path } from "./runtime/tree.ts";
-import type { Answerer, Assignment, EndResult, Origin, Owner, Reply, Requester, RunInput, RunResult, StatusView, TurnRunner } from "./runtime/types.ts";
+import type { Answerer, Assignment, EndResult, EnqueueResult, Origin, Owner, Reply, Requester, RunInput, RunResult, StatusView, TurnRunner } from "./runtime/types.ts";
 import { sameRequest } from "./same-request.ts";
+import type { GoalRuntimePort } from "./goals/runtime-port.ts";
 
 const NOT_RUNNING = "The originating room task is no longer running";
 const WRONG_SPEAKER = "The handoff belongs to a different room speaker";
@@ -116,11 +117,14 @@ export class RuntimeCoordinator implements Coordinator {
   private readonly legacyThreads: LegacyThreadResolver | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
+  private readonly persistentGoals: CoordinatorOptions["persistentGoals"];
   private opened = false;
+  private goalSchedulerReady = false;
   private prunedAt: number | undefined;
 
   constructor(options: CoordinatorOptions) {
     this.host = options.host;
+    this.persistentGoals = options.persistentGoals;
     this.legacyDir = options.dataDir === ":memory:" ? undefined : options.dataDir;
     this.legacyFile = this.legacyDir === undefined ? undefined : join(this.legacyDir, "room-handoffs.json");
     this.legacyThreads = options.legacyThreads;
@@ -130,6 +134,8 @@ export class RuntimeCoordinator implements Coordinator {
     this.runtime = new Runtime(this.store, this.runner(), {
       clock: { now: () => this.now(), monotonic: () => performance.now() },
       limits: { depth: 4, requests: REQUESTS_PER_ROOT, executions: EXECUTIONS_PER_ROOT, turnStallMs: TURN_STALL_MS, ...options.runtimeLimits },
+      ...(options.persistentGoals ? { admitClientExecution: (root: string, id: string, no: number) =>
+        this.goalSchedulerReady && options.persistentGoals!.admitExecution(root, id, no) } : {}),
       ...(options.log ? { log: options.log } : {}),
     });
   }
@@ -162,6 +168,46 @@ export class RuntimeCoordinator implements Coordinator {
     this.ready();
     const a = this.store.get(id);
     return a && this.project(a);
+  }
+
+  enqueuePersistentGoal(request: ClientRootRequest): EnqueueResult {
+    if (!this.persistentGoals) return { ok: false, outcome: "refused", reason: "Persistent goal runtime is not configured" };
+    try {
+      const authorized = this.persistentGoals.authorizeRoot(request);
+      if (authorized !== true) return { ok: false, outcome: "refused", reason: authorized };
+      this.ready();
+      return this.runtime.enqueueClientRoot(request);
+    } catch {
+      this.log("persistent goal authorization or enqueue failed");
+      return { ok: false, outcome: "refused", reason: "Persistent goal authorization failed" };
+    }
+  }
+
+  persistentGoalRuntime(): GoalRuntimePort {
+    if (!this.persistentGoals) throw new Error("Persistent goal runtime is not configured");
+    return {
+      runtime: {
+        open: () => this.ready(),
+        tick: () => this.tick(),
+        enqueueClientRoot: request => this.enqueuePersistentGoal(request),
+        cancelClientRoot: id => {
+          this.ready();
+          const settled = this.runtime.cancelClientRoot(id);
+          if (this.persistentGoals?.confirmStopped?.(id) !== true) return false;
+          return settled || this.runtime.confirmClientRootStopped(id, () => true);
+        },
+      },
+      runtimeStore: {
+        transitions: (after, limit) => { this.ready(); return this.store.transitions(after, limit); },
+        root: id => { this.ready(); return this.store.root(id); },
+        isClientRoot: id => { this.ready(); return this.store.isClientRoot(id); },
+        clientRootHeld: id => { this.ready(); return this.store.clientRootHeld(id); },
+        clientRequest: key => { this.ready(); return this.store.clientRequest(key); },
+        get: id => { this.ready(); return this.store.get(id); },
+      },
+      activate: () => { this.goalSchedulerReady = true; },
+      deactivate: () => { this.goalSchedulerReady = false; },
+    };
   }
 
   has(id: string): boolean {
@@ -208,7 +254,7 @@ export class RuntimeCoordinator implements Coordinator {
       c.assignee.destination.groupId === target.groupId && c.assignee.botId === target.botId && c.status === "completed")) throw new Error(ALREADY_COMPLETED);
     if (kind === "work" && target.groupId && lineage.some(n => n.assignee.destination.groupId === target.groupId)) throw new Error(ROOM_ANCESTOR);
     const wanted: Reply = mode === "notify" ? "none" : options.reply ?? "resume";
-    const reply: Reply = wanted === "none" ? "none" : root.reply === "poll" ? "poll" : wanted;
+    const reply: Reply = wanted === "none" ? "none" : root.reply === "poll" && !this.store.isClientRoot(root.id) ? "poll" : wanted;
     const requester: Requester = { kind: "bot_turn", botId: parent.assignee.botId, threadId: parent.assignee.destination.threadId,
       chief: this.host.chiefOf(address(parent)), ...(parent.id === root.id && root.requester.runId !== undefined ? { runId: root.requester.runId } : {}) };
     const level = this.host.levelOf(target, this.project(parent));
@@ -445,6 +491,7 @@ export class RuntimeCoordinator implements Coordinator {
   }
 
   close(): void {
+    this.goalSchedulerReady = false;
     this.runtime.close();
   }
 
@@ -514,7 +561,7 @@ export class RuntimeCoordinator implements Coordinator {
     if (result.cap) return { kind: "continue", text: result.text, note: result.cap.note, ...(result.cap.handoffPath ? { handoffPath: result.cap.handoffPath } : {}), ...evidence(result) };
     if (result.cards) return { kind: "needs_input", question: result.cards.question, cards: result.cards.ids, ...evidence(result) };
     if (!result.ok) return { kind: "failed", outcome: result.stalled ? "stalled" : "provider_error", text: result.text, ...evidence(result) };
-    const question = root ? undefined : needsInputQuestion(result.text);
+    const question = root && !this.store.isClientRoot(a.id) ? undefined : needsInputQuestion(result.text);
     if (question === undefined) return { kind: "completed", text: result.text, ...evidence(result) };
     const named = withDefault(question);
     const decide = requesterDecides(a) && !result.privateQuestion && !personOnly(named.question) ? { decide: named.default ? { default: named.default } : {} } : {};
@@ -579,6 +626,10 @@ export class RuntimeCoordinator implements Coordinator {
   }
 
   private project(a: Assignment): HandoffView {
-    return view(a, a.parentId ? this.store.get(a.parentId) : undefined);
+    const projected = view(a, a.parentId ? this.store.get(a.parentId) : undefined);
+    // Client roots are actually dispatched by the runtime; only an ordinary
+    // host-owned root's first turn is presented as the already-running source.
+    if (projected.status === "source" && this.store.isClientRoot(a.id)) projected.status = "running";
+    return projected;
   }
 }

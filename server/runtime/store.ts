@@ -91,6 +91,18 @@ export interface RuntimeStore {
   all(filter?: { rootId?: string; nonTerminal?: boolean; ownerThreadId?: string; assignee?: { botId: string; threadId: string };
     roots?: boolean; openSince?: number }): Assignment[];
   insert(a: Assignment, event: { kind: EventKind; detail?: string; at?: number }): void;
+  insertClientRoot(key: string, hash: string, root: Assignment, delegation?: "allow" | "deny"): { assignment: Assignment; duplicate: boolean };
+  clientRoot(key: string): Assignment | undefined;
+  clientRequest(key: string): { hash: string; assignment: Assignment } | undefined;
+  isClientRoot(rootId: string): boolean;
+  clientRootHeld(rootId: string): boolean;
+  holdClientRoot(rootId: string, at: number): void;
+  clearClientHold(rootId: string): void;
+  clientStopPending(rootId: string): boolean;
+  markClientStopPending(rootId: string): void;
+  clearClientStopPending(rootId: string): void;
+  clientRootDeniesDelegation(rootId: string): boolean;
+  transitions(after: number, limit: number): AssignmentEvent[];
   update(a: Assignment, event?: { kind: EventKind; detail?: string; at?: number }): void;
   /** Nested calls join the outer transaction (a savepoint inside it). */
   transaction<T>(fn: () => T): T;
@@ -140,6 +152,23 @@ const SCHEMA = `
     detail TEXT
   );
   CREATE INDEX IF NOT EXISTS assignment_events_assignment ON assignment_events(assignment_id, id);
+  CREATE TABLE IF NOT EXISTS runtime_client_requests (
+    dispatch_key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    root_id TEXT NOT NULL UNIQUE REFERENCES assignments(id)
+  );
+  CREATE TABLE IF NOT EXISTS runtime_client_holds (
+    root_id TEXT PRIMARY KEY REFERENCES runtime_client_requests(root_id),
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS runtime_client_stop_pending (
+    root_id TEXT PRIMARY KEY REFERENCES runtime_client_requests(root_id)
+  );
+  CREATE TABLE IF NOT EXISTS runtime_client_policies (
+    root_id TEXT PRIMARY KEY REFERENCES runtime_client_requests(root_id),
+    delegation TEXT NOT NULL CHECK(delegation IN ('allow','deny'))
+  );
   CREATE TABLE IF NOT EXISTS inbox (
     id TEXT PRIMARY KEY,
     owner_bot_id TEXT,
@@ -217,12 +246,25 @@ export function openRuntimeStore(path: string): RuntimeStore {
       requester_run_id = ?, assignee_bot_id = ?, assignee_thread_id = ?, created_at = ?, finished_at = ?, json = ? WHERE id = ?`),
     event: db.prepare("INSERT INTO assignment_events (assignment_id, at, kind, detail) VALUES (?, ?, ?, ?)"),
     events: db.prepare("SELECT id, assignment_id, at, kind, detail FROM assignment_events WHERE assignment_id = ? ORDER BY id"),
+    clientRequest: db.prepare("SELECT request_hash, root_id FROM runtime_client_requests WHERE dispatch_key = ?"),
+    clientRootExists: db.prepare("SELECT 1 FROM runtime_client_requests WHERE root_id = ?"),
+    clientHold: db.prepare("SELECT 1 FROM runtime_client_holds WHERE root_id = ?"),
+    deleteClientHold: db.prepare("DELETE FROM runtime_client_holds WHERE root_id = ?"),
+    insertClientHold: db.prepare("INSERT OR IGNORE INTO runtime_client_holds (root_id, reason, created_at) VALUES (?, 'interrupted execution requires reconciliation', ?)"),
+    clientStop: db.prepare("SELECT 1 FROM runtime_client_stop_pending WHERE root_id = ?"),
+    insertClientStop: db.prepare("INSERT OR IGNORE INTO runtime_client_stop_pending (root_id) VALUES (?)"),
+    deleteClientStop: db.prepare("DELETE FROM runtime_client_stop_pending WHERE root_id = ?"),
+    clientPolicy: db.prepare("SELECT delegation FROM runtime_client_policies WHERE root_id = ?"),
+    insertClientPolicy: db.prepare("INSERT INTO runtime_client_policies (root_id, delegation) VALUES (?, ?)"),
+    transitions: db.prepare("SELECT id, assignment_id, at, kind, detail FROM assignment_events WHERE id > ? ORDER BY id LIMIT ?"),
+    insertClientRequest: db.prepare("INSERT INTO runtime_client_requests (dispatch_key, request_hash, root_id) VALUES (?, ?, ?)"),
     addInbox: db.prepare(`INSERT INTO inbox (id, owner_bot_id, owner_thread_id, owner_run_id, assignment_id, kind, created_at, delivered_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
     deliver: db.prepare("UPDATE inbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
     prunable: db.prepare(`SELECT id FROM assignments r WHERE r.parent_id IS NULL AND r.status IN (${terminalList})
       AND r.finished_at IS NOT NULL AND r.finished_at < ?
-      AND NOT EXISTS (SELECT 1 FROM assignments c WHERE c.root_id = r.id AND c.status NOT IN (${terminalList}))`),
+      AND NOT EXISTS (SELECT 1 FROM assignments c WHERE c.root_id = r.id AND c.status NOT IN (${terminalList}))
+      AND NOT EXISTS (SELECT 1 FROM runtime_client_requests q WHERE q.root_id = r.id)`),
     pruneEvents: db.prepare("DELETE FROM assignment_events WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
     pruneInbox: db.prepare("DELETE FROM inbox WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
     pruneRows: db.prepare("DELETE FROM assignments WHERE root_id = ?"),
@@ -301,6 +343,74 @@ export function openRuntimeStore(path: string): RuntimeStore {
         statements.insert.run(a.id, ...columns(a));
         writeEvent(a.id, event);
       });
+    },
+    insertClientRoot(key, hash, root, delegation = "allow") {
+      if (!key || !hash || root.parentId !== undefined || root.id !== root.rootId || root.depth !== 0 ||
+        root.status !== "queued" || root.executions !== 0 || root.requester.kind !== "external_runtime" || root.reply !== "poll") {
+        throw new Error("runtime.db: invalid client root request");
+      }
+      return transaction(() => {
+        const existing = statements.clientRequest.get(key) as Row | undefined;
+        if (existing) {
+          if (existing.request_hash !== hash) throw new Error("runtime.db: dispatch key conflict");
+          const row = statements.get.get(String(existing.root_id)) as Row | undefined;
+          if (!row) throw new Error("runtime.db: client root missing");
+          return { assignment: readAssignment(row), duplicate: true };
+        }
+        assignmentSchema.parse(root);
+        statements.insert.run(root.id, ...columns(root));
+        writeEvent(root.id, { kind: "enqueued", at: root.createdAt, detail: "queued: client root" });
+        statements.insertClientRequest.run(key, hash, root.id);
+        statements.insertClientPolicy.run(root.id, delegation);
+        return { assignment: root, duplicate: false };
+      });
+    },
+    clientRoot(key) {
+      const request = statements.clientRequest.get(key) as Row | undefined;
+      if (!request) return undefined;
+      const row = statements.get.get(String(request.root_id)) as Row | undefined;
+      if (!row) throw new Error("runtime.db: client root missing");
+      return readAssignment(row);
+    },
+    clientRequest(key) {
+      const request = statements.clientRequest.get(key) as Row | undefined;
+      if (!request) return undefined;
+      const row = statements.get.get(String(request.root_id)) as Row | undefined;
+      if (!row) throw new Error("runtime.db: client root missing");
+      return { hash: String(request.request_hash), assignment: readAssignment(row) };
+    },
+    isClientRoot(rootId) {
+      return statements.clientRootExists.get(rootId) !== undefined;
+    },
+    clientRootHeld(rootId) {
+      return statements.clientHold.get(rootId) !== undefined;
+    },
+    clearClientHold(rootId) { statements.deleteClientHold.run(rootId); },
+    holdClientRoot(rootId, at) {
+      transaction(() => {
+        if (!statements.clientRootExists.get(rootId)) throw new Error("runtime.db: client root missing");
+        if (statements.insertClientHold.run(rootId, at).changes === 1) {
+          writeEvent(rootId, { kind: "restart_reconciled", at, detail: "reconciling: interrupted execution requires review" });
+        }
+      });
+    },
+    clientStopPending(rootId) { return statements.clientStop.get(rootId) !== undefined; },
+    markClientStopPending(rootId) {
+      transaction(() => {
+        if (!statements.clientRootExists.get(rootId)) throw new Error("runtime.db: client root missing");
+        statements.insertClientStop.run(rootId);
+      });
+    },
+    clearClientStopPending(rootId) { statements.deleteClientStop.run(rootId); },
+    clientRootDeniesDelegation(rootId) {
+      if (!statements.clientRootExists.get(rootId)) return false;
+      return (statements.clientPolicy.get(rootId) as Row | undefined)?.delegation !== "allow";
+    },
+    transitions(after, limit) {
+      if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+        throw new Error("runtime.db: invalid transition page");
+      }
+      return (statements.transitions.all(after, limit) as Row[]).map(readEvent);
     },
     update(a, event) {
       transaction(() => {

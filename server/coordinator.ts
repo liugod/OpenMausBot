@@ -2,6 +2,8 @@ import { RuntimeCoordinator } from "./runtime-coordinator.ts";
 import type { WorkOrigin } from "./peer-provenance.ts";
 import type { LegacyThreadResolver } from "./runtime/import-legacy.ts";
 import type { Answerer, Assignment, EnvelopeNames, Level, Limits, Mode, Origin, Outcome, Owner, Reply, Requester, StatusView, TurnEvidence } from "./runtime/types.ts";
+import type { ClientRootRequest } from "./runtime/runtime.ts";
+import type { GoalRuntimePort } from "./goals/runtime-port.ts";
 
 /** One coordinate_bots call, as the internal route hands it to the server. */
 export type CoordinateBotsCall = {
@@ -152,6 +154,8 @@ export interface CoordinatorHost {
 }
 
 export interface Coordinator {
+  /** Internal host capability; callers must enforce goal ownership before using it. */
+  persistentGoalRuntime?(): GoalRuntimePort;
   node(id: string): HandoffView | undefined;
   has(id: string): boolean;
   all(): HandoffView[];
@@ -204,6 +208,14 @@ export interface CoordinatorOptions {
   runtimeLimits?: Partial<Limits>;
   log?: (line: string) => void;
   legacyThreads?: LegacyThreadResolver;
+  persistentGoals?: {
+    /** Check the frozen request's owner, origin and effective level against the current host grants. */
+    authorizeRoot(request: ClientRootRequest): true | string;
+    /** Recheck that authority and persist an idempotent budget reservation before every execution. */
+    admitExecution(rootId: string, assignmentId: string, executionNo: number): boolean;
+    /** Confirm the host has actually stopped every execution in the tree; an abort request alone is not confirmation. */
+    confirmStopped?(rootId: string): boolean;
+  };
 }
 
 export function createCoordinator(options: CoordinatorOptions): Coordinator {

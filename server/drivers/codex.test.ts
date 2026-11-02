@@ -156,6 +156,19 @@ describe("CodexDriver turns (fake app-server)", () => {
     scratch = mkdtempSync(join(tmpdir(), "omb-codex-test-"));
   });
 
+  it("reports a synchronous process launch failure and finishes the turn", async () => {
+    await create({ managed: true });
+    const spawn = vi.spyOn(procs, "spawnCli").mockImplementation(() => { throw Object.assign(new Error("spawn EINVAL"), { code: "EINVAL" }); });
+    try {
+      await instance.adapter.sendTurn({ threadId: "spawn-failure", text: "Fixture", model: "company-codex-model" });
+      await recorder.until(event => event.type === "turn.completed");
+      expect(recorder.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "runtime.error" }),
+        expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "spawn_error" }),
+      ]));
+    } finally { spawn.mockRestore(); }
+  });
+
   it("says once when its team tools did not start", async () => {
     await create({ environment: { HOME: scratch, CODEX_HOME: join(scratch, ".codex"), FAKE_CODEX_MCP_FAILED: "agents" } });
     await instance.adapter.sendTurn({ threadId: "team-tools", text: "Fixture" });

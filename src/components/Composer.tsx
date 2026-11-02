@@ -75,6 +75,7 @@ import { useThreadApproval } from "./thread-approval";
 import { useStackedField, useTallPill } from "./composer-wrap";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ComposerReplyStrip } from "./ReplyQuote";
+import { PersistentTaskButton } from "./PersistentTaskButton";
 import { escapeCancelsReply } from "@/lib/replies";
 import { useThreadRefs } from "./ThreadRefs";
 import {
@@ -699,6 +700,8 @@ export function Composer({
 
   return (
     <div className={cn("pointer-events-none relative px-5", simpleDock ? "pb-4" : "pb-3")}>
+      {!group && bot && new URLSearchParams(window.location.search).get("persistent-work") === "1" && <PersistentTaskButton botId={bot.id} threadId={threadId} text={text} hasAttachments={attachments.length > 0} disabled={locked || attachmentPending}
+        onSubmitted={(() => { const revision = draftRevision(draftId); return () => { if (draftRevision(draftId) === revision) setText(""); }; })()} />}
       {speechError && (
         <div className="pointer-events-auto mb-2 w-full rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
           {speechError}

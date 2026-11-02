@@ -25,6 +25,7 @@ export interface AgentsTurn {
   skillAuthoring: boolean;
   roomHandoffId?: string;
   deliversSavedFiles?: boolean;
+  goalRole?: "plan" | "work" | "review";
 }
 
 const flag = (on: boolean) => (on ? "1" : "0");
@@ -48,6 +49,7 @@ export function agentsServerEnv(conversation: AgentsConversation, turn: AgentsTu
     ...roleToolEnv(bot),
     OMB_ESCALATIONS: flag(host.escalations),
     OMB_COMPUTER_SELECTION: flag(!conversation.room && bot.computer !== "off" && !conversation.teamComputer),
+    ...(turn.goalRole ? { OMB_GOAL_ROLE: turn.goalRole } : {}),
   };
 }
 

@@ -59,6 +59,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { lastNonReceipt } from "@/lib/receipts";
 import { useTurnLive } from "@/state/turn-status"; import { useTurnNow } from "./NowCard";
 import { ChatMarkdown } from "./ChatMarkdown";
+import { PersistentWorkChat } from "./PersistentWorkChat";
 import { liveToolIds } from "@/lib/tool-liveness";
 import { VoiceNoteBubble, type VoiceNoteAttachment } from "./VoiceNoteBubble";
 import { RawMarkdownView, RawToggleAction } from "./RawMarkdownToggle";
@@ -1144,6 +1145,7 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
 
       <ChatErrorBanner message={state.error} onDismiss={() => dispatch({ type: "error", message: null })} />
       <ChatNotice notice={state.notice} />
+      {new URLSearchParams(window.location.search).get("persistent-work") === "1" && <PersistentWorkChat botId={bot.id} threadId={bot.threadId} />}
 
       <PinnedBanner
         bot={bot}

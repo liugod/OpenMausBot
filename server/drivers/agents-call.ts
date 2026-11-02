@@ -7,6 +7,7 @@ import { peerName } from "../peer-roster.ts";
 import { callCardTool, CARD_TOOL_NAMES } from "./agents-call-cards.ts";
 import { callTriggerTool, TRIGGER_TOOL_NAMES } from "./agents-call-triggers.ts";
 import { catalogProfileFromEnv, fullInputSchema, SHARED_COMPUTER_TOOL_NAMES } from "./agents-catalog.ts";
+import { GOAL_TOOL_ROLES } from "./agents-goal-tools.ts";
 import { harnessClientFromEnv } from "./agents-client.ts";
 import type { HarnessClient, Json } from "./agents-client.ts";
 import { memorySearchText } from "./memory-search-text.ts";
@@ -188,6 +189,10 @@ export async function callTool(called: string, input: Json, context: ToolCallCon
   const member = agentsCallMember(name, args);
   const { botId: BOT_ID, threadId: THREAD_ID, depth: DEPTH } = context;
   const { api, apiResponse } = context.client;
+  if (GOAL_TOOL_ROLES[name]) {
+    const response = await apiResponse(`/api/internal/persistent-goals/${name}`, { method: "POST", body: JSON.stringify(args) });
+    return { text: JSON.stringify(response.body), ...(!response.ok ? { isError: true } : {}) };
+  }
   if (name === "vm_exec") {
     const { ok, body } = await apiResponse("/api/internal/vm-exec", {
       method: "POST",

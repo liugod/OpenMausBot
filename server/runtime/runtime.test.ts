@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { checkInvariants } from "./invariants.ts";
-import { Runtime, type BeginRequest } from "./runtime.ts";
+import { Runtime, type BeginRequest, type RuntimeOptions } from "./runtime.ts";
 import { openRuntimeStore, type RuntimeStore } from "./store.ts";
+import { openExecutionBudgetStore } from "../goals/execution-budget.ts";
 import { CUT_TWICE, INTERRUPTED_OUTWARD, loopStop, nextGuard, outwardDetail } from "./tree.ts";
 import type { Assignment, Clock, EnqueueRequest, Limits, RunInput, RunResult, TurnRunner } from "./types.ts";
 
@@ -75,12 +76,12 @@ const toBot = (botId: string, parentId: string, brief = `Build it, ${botId}`, pa
 });
 
 interface World { store: RuntimeStore; runner: Fake; clock: FakeClock; runtime: Runtime; logs: string[]; limits: Partial<Limits> }
-function world(script?: Script, limits: Partial<Limits> = {}, store = openRuntimeStore(":memory:"), ports: Pick<TurnRunner, "outward"> = {}): World {
+function world(script?: Script, limits: Partial<Limits> = {}, store = openRuntimeStore(":memory:"), ports: Pick<TurnRunner, "outward"> = {}, options: RuntimeOptions = {}): World {
   const runner = fakeRunner(script);
   if (ports.outward) runner.outward = ports.outward;
   const clock = fakeClock();
   const logs: string[] = [];
-  const runtime = new Runtime(store, runner, { clock, limits, log: line => logs.push(line) });
+  const runtime = new Runtime(store, runner, { ...options, clock, limits, log: line => logs.push(line) });
   runtime.open();
   return { store, runner, clock, runtime, logs, limits };
 }
@@ -89,6 +90,164 @@ type EnqueueResult = ReturnType<Runtime["enqueue"]>;
 const invariants = (w: World) => expect(checkInvariants(w.store, w.runner.live())).toEqual([]);
 
 describe("Runtime: one tree, one lane", () => {
+  it("accepts a stable client root once and detects changes to a replayed request", () => {
+    const w = world();
+    const req = { dispatchKey: "goal:g:attempt:a", rootId: "root-a", requesterRef: "attempt-a",
+      origin: { kind: "person" as const, source: "chat" as const }, assignee: chief, brief: "Plan", level: "ask" as const };
+    const first = w.runtime.enqueueClientRoot(req);
+    expect(first).toMatchObject({ ok: true, duplicate: false, assignment: { id: "root-a", status: "queued", executions: 0 } });
+    w.runner.validateAnswer = "access revoked";
+    expect(w.runtime.enqueueClientRoot(req)).toMatchObject({ ok: true, duplicate: true, assignment: { id: "root-a" } });
+    expect(w.runtime.enqueueClientRoot({ ...req, brief: "Different" })).toMatchObject({ ok: false, reason: /conflict/ });
+    expect(w.runtime.enqueueClientRoot({ ...req, dispatchKey: "another", rootId: "root-b" })).toMatchObject({ ok: false, reason: "access revoked" });
+    expect(w.store.all()).toHaveLength(1);
+    w.store.close();
+  });
+
+  it("keeps a client root queued while admission is unavailable beyond ordinary runtime timeouts", () => {
+    const w = world(undefined, { queueMs: 10, stallMs: 10 });
+    const result = w.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "client", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: chief, brief: "Work", level: "ask" });
+    expect(result.ok).toBe(true);
+    w.clock.advance(100);
+    w.runtime.tick();
+    expect(w.store.get("client")?.status).toBe("queued");
+    expect(w.runner.runs).toHaveLength(0);
+    w.store.close();
+  });
+
+  it("holds an interrupted client tree for reconciliation instead of rerunning it", () => {
+    const store = openRuntimeStore(":memory:");
+    const first = world(() => "hold", {}, store, {}, { admitClientExecution: () => true });
+    const result = first.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "client", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: chief, brief: "Work", level: "ask" });
+    expect(result.ok).toBe(true);
+    first.runtime.tick();
+    expect(store.get("client")?.status).toBe("running");
+    first.runtime.close();
+    const restarted = world(undefined, {}, store, {}, { admitClientExecution: () => true });
+    expect(store.clientRootHeld("client")).toBe(true);
+    expect(store.get("client")).toMatchObject({ status: "waiting", executions: 1, restarts: 0 });
+    restarted.clock.advance(1_000_000_000);
+    restarted.runtime.tick();
+    expect(restarted.runner.runs).toHaveLength(0);
+    expect(store.get("client")?.status).toBe("waiting");
+    const again = world(undefined, {}, store, {}, { admitClientExecution: () => true });
+    again.runtime.tick();
+    expect(again.runner.runs).toHaveLength(0);
+    expect(store.clientRootHeld("client")).toBe(true);
+    store.close();
+  });
+
+  it("enforces a frozen management delegation policy inside the runtime", () => {
+    const w = world(() => "hold", {}, openRuntimeStore(":memory:"), {}, { admitClientExecution: () => true });
+    const req = { dispatchKey: "plan-key", rootId: "plan-root", requesterRef: "plan-attempt",
+      origin: { kind: "person" as const, source: "chat" as const }, assignee: chief, brief: "Plan", level: "ask" as const, delegation: "deny" as const };
+    expect(w.runtime.enqueueClientRoot(req)).toMatchObject({ ok: true, duplicate: false });
+    expect(w.runtime.enqueueClientRoot({ ...req, delegation: "allow" })).toMatchObject({ ok: false, reason: /conflict/ });
+    w.runtime.tick();
+    expect(w.store.get("plan-root")?.status).toBe("running");
+    expect(w.runtime.enqueue(toBot("builder", "plan-root"))).toMatchObject({ ok: false, reason: /cannot delegate/ });
+    expect(w.store.children("plan-root")).toEqual([]);
+    w.store.close();
+  });
+
+  it("does not execute client roots without a budget admission and admits every continuation", async () => {
+    const store = openRuntimeStore(":memory:");
+    const seed = world(undefined, {}, store);
+    const root = { ...seed.runtime.begin(beginReq({ id: "seed" })), id: "client", rootId: "client", status: "queued" as const,
+      requester: { kind: "external_runtime" as const, runId: "attempt" }, reply: "poll" as const, executions: 0,
+      assignee: { botId: "worker", destination: { kind: "work_thread" as const, threadId: "worker-thread" } },
+      startedAt: undefined, budgets: { since: seed.clock.now(), requests: 0, executions: 0, wakes: 0 } };
+    store.insertClientRoot("key", "hash", root);
+    seed.runtime.tick();
+    expect(seed.runner.runs).toHaveLength(0);
+    expect(store.get("client")?.status).toBe("queued");
+    const admitted: Array<[string, string, number]> = [];
+    const budget = openExecutionBudgetStore(":memory:");
+    budget.create("goal", 1);
+    budget.bindRoot("goal", "client");
+    const w = world((_a, input) => input.turn === "first"
+      ? { kind: "continue", text: "part", note: "continue" }
+      : { kind: "completed", text: "done" }, {}, store, {}, {
+      admitClientExecution: (rootId, assignmentId, executionNo) => {
+        admitted.push([rootId, assignmentId, executionNo]);
+        return budget.admit(rootId, assignmentId, executionNo);
+      },
+    });
+    w.runtime.tick();
+    await flush();
+    w.runtime.tick();
+    expect(admitted).toEqual([["client", "client", 1], ["client", "client", 2]]);
+    expect(w.runner.runs.filter(run => run.a.id === "client")).toHaveLength(1);
+    expect(store.get("client")?.executions).toBe(1);
+    expect(budget.usage("goal")).toEqual({ limit: 1, reserved: 1 });
+    budget.close();
+    store.close();
+  });
+
+  it("applies the same goal budget to a root's child execution", async () => {
+    const budget = openExecutionBudgetStore(":memory:");
+    budget.create("goal", 1);
+    budget.bindRoot("goal", "client");
+    const w = world((a) => {
+      if (a.id === "client") ok(w.runtime.enqueue(toBot("builder", a.id)));
+      return { kind: "completed", text: "delegated" };
+    }, {}, openRuntimeStore(":memory:"), {}, { admitClientExecution: (root, id, no) => budget.admit(root, id, no) });
+    expect(w.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "client", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: chief, brief: "Work", level: "ask" }).ok).toBe(true);
+    w.runtime.tick();
+    await flush();
+    w.runtime.tick();
+    expect(w.runner.runs.map(run => run.a.id)).toEqual(["client"]);
+    expect(w.store.children("client")[0]).toMatchObject({ status: "queued", executions: 0 });
+    expect(budget.usage("goal")).toEqual({ limit: 1, reserved: 1 });
+    w.store.close();
+    budget.close();
+  });
+
+  it("resumes a client poll root to synthesize its child's actual result", async () => {
+    const w = world((a, input) => {
+      if (a.id === "client" && input.turn === "first") {
+        ok(w.runtime.enqueue(toBot("builder", a.id)));
+        return { kind: "completed", text: "delegated" };
+      }
+      return { kind: "completed", text: a.id === "client" ? "synthesized" : "built" };
+    }, {}, openRuntimeStore(":memory:"), {}, { admitClientExecution: () => true });
+    expect(w.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "client", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: chief, brief: "Work", level: "ask" }).ok).toBe(true);
+    w.runtime.tick(); await flush();
+    expect(w.store.get("client")?.status).toBe("waiting");
+    w.runtime.tick(); await flush();
+    expect(w.store.children("client")[0]).toMatchObject({ status: "completed", result: "built" });
+    w.runtime.tick(); await flush();
+    const runs = w.runner.runs.filter(run => run.a.id === "client");
+    expect(runs).toHaveLength(2);
+    expect(runs[1]?.input.settled?.[0]).toMatchObject({ result: "built" });
+    expect(w.store.get("client")).toMatchObject({ status: "completed", result: "synthesized", executions: 2 });
+    w.store.close();
+  });
+
+  it("resumes a client poll root when a child needs input", async () => {
+    const w = world((a, input) => {
+      if (a.id === "client" && input.turn === "first") {
+        ok(w.runtime.enqueue(toBot("builder", a.id)));
+        return { kind: "completed", text: "delegated" };
+      }
+      if (a.assignee.botId === "builder") return { kind: "needs_input", question: "Which region?" };
+      return { kind: "needs_input", question: "Please choose a region" };
+    }, {}, openRuntimeStore(":memory:"), {}, { admitClientExecution: () => true });
+    expect(w.runtime.enqueueClientRoot({ dispatchKey: "key", rootId: "client", requesterRef: "attempt",
+      origin: { kind: "person", source: "chat" }, assignee: chief, brief: "Work", level: "ask" }).ok).toBe(true);
+    w.runtime.tick(); await flush();
+    w.runtime.tick(); await flush();
+    w.runtime.tick(); await flush();
+    const runs = w.runner.runs.filter(run => run.a.id === "client");
+    expect(runs).toHaveLength(2);
+    expect(runs[1]?.input.asked?.[0]).toMatchObject({ question: "Which region?" });
+    expect(w.store.get("client")).toMatchObject({ status: "needs_input", question: "Please choose a region" });
+    w.store.close();
+  });
   it("runs a child, reports it once, then wakes the root with the settled children in one resume turn", async () => {
     const w = world();
     const root = w.runtime.begin(beginReq());

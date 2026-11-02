@@ -10,6 +10,7 @@ import { COMPUTER_ASK_TOOL_DEFINITIONS, COMPUTER_ASK_TOOL_NAMES } from "./agents
 import { MAUSBOT_TOOL_DEFINITIONS } from "./agents-mausbot-tools.ts";
 import { PERSON_TOOL_DEFINITIONS, PERSON_TOOL_NAMES } from "./agents-person-tools.ts";
 import { RESEARCH_TOOL_DEFINITIONS, RESEARCH_TOOL_NAMES, X_TOOL_NAMES } from "./agents-research-tools.ts";
+import { GOAL_TOOL_DEFINITIONS, GOAL_TOOL_ROLES } from "./agents-goal-tools.ts";
 import type { CatalogProfile } from "./agents-catalog-profile.ts";
 import { advertisedSchema } from "./agents-schema.ts";
 export { catalogProfileFromEnv, type CatalogProfile } from "./agents-catalog-profile.ts";
@@ -165,6 +166,7 @@ const APPLIES_OUTCOME = " Read the result: it applies immediately at every acces
 const START_THREAD_SELF_ID = "Leave out, or use your own bot ID. For teammates use coordinate_bots.";
 
 const TOOL_DEFINITIONS = [
+  ...GOAL_TOOL_DEFINITIONS,
   {
     name: "create_options_card",
     description:
@@ -896,6 +898,7 @@ export function fullInputSchema(name: string): unknown {
 
 function catalogTools(profile: CatalogProfile) {
   const BOT_SCOPED_TOOLS = TOOL_DEFINITIONS.filter((tool) =>
+    (!GOAL_TOOL_ROLES[tool.name] || (!!profile.goalRole && GOAL_TOOL_ROLES[tool.name]!.includes(profile.goalRole))) &&
     (profile.botId === WATCHER_OPTIONS_CARD_BOT_ID || !WATCHER_TOOL_NAMES.has(tool.name)) &&
     (profile.memoryEnabled !== false || (tool.name !== "memory_update" && tool.name !== "memory_log")) &&
     (profile.escalations === true || tool.name !== "raise_escalation") &&
