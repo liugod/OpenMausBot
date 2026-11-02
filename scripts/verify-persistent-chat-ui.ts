@@ -13,7 +13,7 @@ try {
   const bot = (await owner("POST", "/api/bots", { name: "Isolated Chat Bot" })).bot;
   await owner("POST", "/api/persistent-work/chat-tasks", { commandId: "isolated-chat-test", botId: bot.id, threadId: bot.threadId,
     request: "Synthetic research task", executionLimit: 8 });
-  preview = await mountPreview(fixture, { entry: "/src/testing/persistent-chat.tsx", route: "/__persistent-chat.html", title: "Isolated chat test",
+  preview = await mountPreview(fixture, { entry: "/src/testing/persistent-app.tsx", route: "/__persistent-chat.html", title: "Isolated chat test",
     proxyHeaders: { authorization: `Bearer ${session.token}` }, logLevel: "silent" });
   if (process.env.OMB_VERIFY_BROWSER_MANUAL === "1") {
     console.log(`PREVIEW ${preview.previewUrl}?persistent-work=1`);

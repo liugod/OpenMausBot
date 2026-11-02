@@ -73,6 +73,13 @@ export async function mountPreview(
       configureServer(server) {
         server.middlewares.use((req, res, next) => {
           const pathname = (req.url ?? "").split("?")[0]!;
+          if (localOriginOnly && pathname === "/index.html") {
+            const url = new URL(req.url ?? "/index.html", `http://127.0.0.1:${port}`);
+            if (!url.searchParams.has("persistent-work")) {
+              url.searchParams.set("persistent-work", "1");
+              res.writeHead(302, { location: `${url.pathname}${url.search}` }); res.end(); return;
+            }
+          }
           if (localOriginOnly && pathname.startsWith("/api/")) {
             const origin = req.headers.origin;
             const expected = `http://127.0.0.1:${port}`;

@@ -1145,7 +1145,7 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
 
       <ChatErrorBanner message={state.error} onDismiss={() => dispatch({ type: "error", message: null })} />
       <ChatNotice notice={state.notice} />
-      {new URLSearchParams(window.location.search).get("persistent-work") === "1" && <PersistentWorkChat botId={bot.id} threadId={bot.threadId} />}
+      {new URLSearchParams(window.location.search).get("persistent-work") === "1" && <div className="lg:hidden"><PersistentWorkChat botId={bot.id} threadId={bot.threadId} /></div>}
 
       <PinnedBanner
         bot={bot}

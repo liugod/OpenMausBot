@@ -43,3 +43,20 @@ it("does not preview if the task changed after the status list was loaded", asyn
     expect(host.querySelector("aside a")).toBeNull();
   } finally { await act(async () => root.unmount()); host.remove(); }
 });
+
+it("keeps the task and report area visible as a desktop column", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (path: string) => path.endsWith("/overview")
+    ? { ok: true, json: async () => ({ items: [{ taskId: "t", itemId: "item:one", title: "报告", status: "succeeded", assigneeBotId: "bot" }] }) }
+    : path.includes("?preview=1") ? { ok: true, text: async () => "报告内容" }
+    : { ok: true, json: async () => ({ task: { status: "succeeded" }, artifacts: [{ id: "a", logicalName: "result.md" }] }) }));
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => { root.render(createElement(PersistentWorkChat, { botId: "bot", panel: true })); await Promise.resolve(); await Promise.resolve(); });
+    const panel = host.querySelector<HTMLElement>('[data-persistent-work-panel]')!;
+    expect(panel.textContent).toContain("成果报告");
+    await act(async () => { panel.querySelector<HTMLButtonElement>("button")!.click(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+    expect(panel.querySelector('aside[aria-label="成果报告"]')?.textContent).toContain("报告内容");
+    await act(async () => { panel.querySelector<HTMLButtonElement>('button[aria-label="关闭报告"]')!.click(); });
+    expect(panel.textContent).toContain("成果报告");
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
