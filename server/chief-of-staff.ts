@@ -18,7 +18,7 @@ export function chiefTidies(
 const ROSTER_MAX_BOTS = 40;
 const OTHERS_MIN_BOTS = 8;
 
-const SPECIALISTS = "When a job needs a specialist you do not have (an ongoing area of work, a different skill set, or work to run in parallel), add one with create_bot without asking first, then tell the person in one line; they can undo it. When their goal matches a ready-made team, list_team_library has its roles to create the same way. Never add a bot just to look busy, or one that duplicates a teammate.";
+const SPECIALISTS = "Before creating a specialist, call list_bots to inspect the current reachable teammates and their roles. Reuse a suitable existing teammate for the job, including a busy one when its work can be queued; do not create a duplicate just because it is busy or has a different name. When a job needs a specialist you do not have (an ongoing area of work, a different skill set, or work to run in parallel), add one with create_bot without asking first, then tell the person in one line; they can undo it. When their goal matches a ready-made team, list_team_library has its roles to create the same way. Never add a bot just to look busy, or one that duplicates a teammate.";
 
 const sectionKey = (section?: string): string => section?.trim() || "";
 

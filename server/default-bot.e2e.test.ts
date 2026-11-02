@@ -30,6 +30,32 @@ async function callTool(server: McpServer, name: string, args: unknown): Promise
   }
 }
 
+it("lets the active Chief inspect teammates and create a nonduplicate specialist through its agent tools", async () => {
+  const fixture = await launchVerificationServer({ ...process.env, FAKE_CLAUDE_MODE: "hang" });
+  const control = (args: string[]) => runControlOmb([...args, "--url", fixture.info.url]) as Promise<any>;
+  const bots = async () => (await (await fetch(`${fixture.info.url}/api/bots`, { signal: AbortSignal.timeout(10_000) })).json() as any).bots as any[];
+  try {
+    const [chief] = await bots();
+    expect(chief.chiefOfStaff).toBe(true);
+    const { bot: existing } = await control(["new-bot", "--name", "Existing researcher"]);
+    await control(["send", "--bot", chief.id, "--text", "Stay active."]);
+    await expect.poll(() => existsSync(fixture.fixtureDumpPath), { timeout: 30_000 }).toBe(true);
+    const launched = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")) as { systemPrompt: string; mcpConfig: { mcpServers: Record<string, McpServer> } };
+    expect(launched.systemPrompt).toContain("Before creating a specialist, call list_bots");
+    const agents = launched.mcpConfig.mcpServers.agents!;
+    const roster = await callTool(agents, "list_bots", {});
+    expect(roster.result?.isError, roster.result?.content?.[0]?.text).toBeFalsy();
+    expect(roster.result?.content?.[0]?.text).toContain(existing.name);
+    const created = await callTool(agents, "create_bot", { name: "Isolated Archivist", role: "Archivist", instructions: "Organize the requested synthetic records." });
+    expect(created.result?.isError, created.result?.content?.[0]?.text).toBeFalsy();
+    expect((await bots()).filter((bot) => bot.name === "Isolated Archivist")).toHaveLength(1);
+    const duplicate = await callTool(agents, "create_bot", { name: "Isolated Archivist", role: "Archivist", instructions: "Organize records." });
+    expect(duplicate.result?.isError || duplicate.error).toBeTruthy();
+    expect((await bots()).filter((bot) => bot.name === "Isolated Archivist")).toHaveLength(1);
+    await control(["interrupt", "--bot", chief.id]);
+  } finally { await fixture.close(); }
+}, 120_000);
+
 it("makes MausBot a new install's first bot, never deleted, hidden by its switch, with a Chief's tools after the Chief moves on", async () => {
   const fixture = await launchVerificationServer({ ...process.env, FAKE_CLAUDE_MODE: "hang" });
   const api = async (method: string, path: string, body?: unknown) => {
