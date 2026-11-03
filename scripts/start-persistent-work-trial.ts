@@ -8,6 +8,7 @@ import { verificationServerArgs, verificationServerEnvironment } from "./control
 import { fixtureApi, mountPreview, parkUntilSignal } from "./testing/preview-fixture.ts";
 import { waitForExit } from "../server/testing/cleanup.ts";
 import { freePortBlock } from "../server/testing/ports.ts";
+import { needsTrialAssistant } from "./testing/trial-bootstrap.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dataDir = join(root, ".persistent-work-trial"), uiPort = 19753;
@@ -42,11 +43,14 @@ try {
   const session = await api("POST", "/api/auth/pair", { code: pairing.code, label: "本机试用" });
   const owner = fixtureApi(base, { headers: { authorization: `Bearer ${session.token}` } });
   const list = await owner("GET", "/api/bots");
-  if (!list.bots.some((bot: {name:string}) => bot.name === "目标助手")) {
+  if (needsTrialAssistant(list.bots)) {
     await owner("POST", "/api/bots", { name: "目标助手", description: "执行用户交办的任务并审查成果。", modelSelection: { instanceId: "codex", model } });
   }
   preview = await mountPreview({ info: { url: base } }, { entry: "/scripts/testing/persistent-work-trial.tsx", route: "/", title: "OpenMaus 本机试用", port: uiPort,
     proxyHeaders: { authorization: `Bearer ${session.token}` }, localOriginOnly: true, logLevel: "silent" });
   console.log(`OpenMaus 试用地址：http://127.0.0.1:${uiPort}/`);
-  await parkUntilSignal();
+  await Promise.race([parkUntilSignal(), new Promise<void>(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", () => resolve());
+  })]);
 } finally { await preview?.close(); await waitForExit(child, { signal: "SIGTERM" }); }
