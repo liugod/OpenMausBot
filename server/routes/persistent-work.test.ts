@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { openGoalStore } from "../goals/goal-store.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { createPersistentWorkRoutes } from "./persistent-work.ts";
+import { DatabaseSync } from "node:sqlite";
 import { PASS, type RouteContext } from "./table.ts";
 
 describe("persistent work routes", () => {
@@ -73,4 +74,39 @@ describe("persistent work routes", () => {
       expect((await call("POST", "/api/persistent-work/workstreams", { areaId, name: "Other", kind: "project" })).status).toBe(409);
     } finally { goals.close(); await removeTempDir(dir); }
   });
+});
+it("amends the same owner-scoped task through the route and rejects forged or stale changes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "goal-continuation-route-")), path = join(dir, "goals.db");
+  const goals = openGoalStore(path, { unsafeTestPlanBootstrap: true });
+  let owner = "owner";
+  const route = createPersistentWorkRoutes({ goals, ownerFor: () => owner, confirmStopped: () => true,
+    createGoal: () => ({ goalId: "g", version: 1 }), createItem: () => ({ itemId: "item", version: 1 }) });
+  const call = async (method: string, target: string, body: unknown = {}) => {
+    const output: { status?: number; body?: any } = {}, url = new URL(target, "http://127.0.0.1");
+    await route({ req: {} as IncomingMessage, res: {} as ServerResponse, url, path: url.pathname, method,
+      auth: { kind: "loopback", scopes: ["admin", "client"] }, readBody: (async () => body) as RouteContext["readBody"],
+      json: ((_res: ServerResponse, status: number, response: unknown) => { output.status = status; output.body = response; }) as RouteContext["json"] });
+    return output;
+  };
+  try {
+    goals.create({ id: "g", ownerId: "owner", commandId: "create", title: "Report", request: "Write report", leadBotId: "bot", leadThreadId: "lead", executionLimit: 4 });
+    goals.submitInitialPlanUnchecked({ goalId: "g", ownerId: "owner", commandId: "plan", expectedVersion: 1, requirementRevision: 1, sourceAttemptId: "plan", reason: "test",
+      tasks: [{ id: "task", title: "Report", brief: "Write report", assigneeBotId: "bot", workspaceRef: "allowed", required: true, dependsOn: [],
+        criteria: [{ id: "review", description: "Report", required: true, kind: "lead_review", config: {} }] }] });
+    const url = "/api/persistent-work/goals/g/tasks/task", input = { commandId: "change", expectedVersion: 2, instruction: "Add sources", externalStateChecked: true };
+    expect((await call("GET", `${url}/continuation`)).body.taskRevision).toBe(1);
+    expect((await call("POST", `${url}/amend`, { ...input, ownerId: "other" })).status).toBe(400);
+    owner = "other";
+    expect((await call("POST", `${url}/amend`, input)).status).toBe(404);
+    owner = "owner";
+    expect((await call("POST", url.replace("/goals/", "/items/") + "/amend", input)).status).toBe(404);
+    const result = await call("POST", `${url}/amend`, input);
+    expect(result.status).toBe(200); expect(result.body.affectedTaskIds).toEqual(["task"]);
+    expect((await call("POST", `${url}/amend`, input)).body).toEqual(result.body);
+    expect((await call("POST", `${url}/amend`, { ...input, commandId: "stale" })).status).toBe(409);
+    expect((await call("GET", `${url}/continuation`)).body.taskRevision).toBe(2);
+    const raw = new DatabaseSync(path);
+    try { expect(Number(raw.prepare("SELECT COUNT(*) AS n FROM goals").get()!.n)).toBe(1); }
+    finally { raw.close(); }
+  } finally { goals.close(); await removeTempDir(dir); }
 });

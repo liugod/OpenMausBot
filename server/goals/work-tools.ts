@@ -23,6 +23,13 @@ export function createWorkTools(deps: {
   allowVersionAdvance?: (expectedVersion: number) => boolean;
 }) {
   return {
+    saveCheckpoint(input: unknown) {
+      const bound = deps.goals.workContext(deps.context, deps.isCurrentRun);
+      const result = deps.goals.saveTaskCheckpoint(input, deps.context, deps.isCurrentRun);
+      if (!bound.standalone) return result;
+      const { goalId: _goalId, ...visible } = result;
+      return visible;
+    },
     listInputs() {
       return deps.goals.listWorkInputs(deps.context, deps.isCurrentRun);
     },

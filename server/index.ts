@@ -751,6 +751,7 @@ const persistentWorkStore = process.env.OMB_PERSISTENT_WORK_PREVIEW === "1" && !
 if (persistentWorkStore) ROUTES.push(createPersistentWorkRoutes({ goals: persistentWorkStore,
   ownerFor: auth => !sharedMembership() && auth.kind === "session" && ownerOrAdmin(auth) ? "local-owner" : undefined,
   ...(process.env.OMB_TEST_SEALED_PATH === "1" && process.env.OMB_PERSISTENT_WORK_RUNTIME_TEST === "1" ? {
+    confirmStopped: rootId => fixtureGoalHost?.canContinueRoot(rootId) === true,
     createChatTask: (ownerId, input) => {
       if (!fixtureGoalHost || !fixtureGoalWorkspaces || ownerId !== "local-owner" || !store.bot(input.botId) ||
         !store.taskByThread(input.botId, input.threadId)) throw new Error("task source is unavailable");
@@ -4046,7 +4047,7 @@ const fixtureGoalHost: ReturnType<typeof createPersistentGoalHost> | undefined =
   prepareReadyWork: candidate => {
     if (candidate.ownerId !== "local-owner" || !fixtureGoalWorkspaces!.allows(candidate.task.workspaceRef, candidate.workstreamId, candidate.task.id)) return undefined;
     const cwd = fixtureGoalWorkspaces!.ensure(candidate.task.workspaceRef, candidate.workstreamId, candidate.task.id);
-    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, candidate.planRevision, candidate.task.id])).digest("hex");
+    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, candidate.planRevision, candidate.task.id, candidate.taskRevision])).digest("hex");
     const threadId = `goal-${hash}`;
     const task = store.taskByThread(candidate.task.assigneeBotId, threadId) ??
       store.createTask(candidate.task.assigneeBotId, candidate.task.title, false, undefined, undefined, "ask", undefined, cwd, threadId);
@@ -4055,7 +4056,7 @@ const fixtureGoalHost: ReturnType<typeof createPersistentGoalHost> | undefined =
     return { intent: { goalId: candidate.goalId, attemptId, authorizationRef: "local-owner", request: {
       dispatchKey: attemptId, rootId: attemptId, requesterRef: attemptId, origin: { kind: "person", source: "chat" },
       assignee: { botId: candidate.task.assigneeBotId, destination: { kind: "work_thread", threadId } },
-      brief: `Use goal_context to read your assigned task and its acceptance criteria. Read dependency inputs with list_goal_inputs and read_goal_input if present. Work only in the current directory. Register actual output files with register_goal_artifact, then submit_goal_task_result with honest claims for each criterion. Task: ${candidate.task.brief}`,
+      brief: `Use goal_context to read your assigned task, acceptance criteria and continuation. Treat checkpoint notes as unverified. Inspect existing files and external receipts before repeating actions. Save bounded progress with save_goal_checkpoint between steps. Read dependency inputs with list_goal_inputs and read_goal_input if present. Work only in the current directory. Register actual output files with register_goal_artifact, then submit_goal_task_result with honest claims for each criterion. Task: ${candidate.task.brief}`,
       level: "ask", delegation: "deny" } }, resolveWritableWorkspace: reference => {
         if (reference !== candidate.task.workspaceRef) throw new Error("unexpected task workspace");
         return cwd;
@@ -4064,12 +4065,12 @@ const fixtureGoalHost: ReturnType<typeof createPersistentGoalHost> | undefined =
   prepareReadyReview: candidate => {
     const goal = fixtureGoalHost!.goals.read(candidate.goalId, candidate.ownerId);
     if (!goal || candidate.ownerId !== "local-owner") return undefined;
-    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, goal.planRevision, candidate.taskId])).digest("hex");
+    const hash = createHash("sha256").update(JSON.stringify([candidate.goalId, goal.planRevision, candidate.taskId, goal.tasks.find(task => task.id === candidate.taskId)?.continuation.taskRevision])).digest("hex");
     const attemptId = `goal-review-${hash}`;
     return { goalId: candidate.goalId, attemptId, authorizationRef: "local-owner", request: {
       dispatchKey: attemptId, rootId: attemptId, requesterRef: attemptId, origin: { kind: "person", source: "chat" },
       assignee: { botId: goal.leadBotId, destination: { kind: "work_thread", threadId: goal.leadThreadId } },
-      brief: "Use goal_context and read_goal_review_artifact to inspect the task and actual evidence, then call submit_goal_review with an honest verdict for every criterion. Do not claim you inspected evidence that is unavailable.",
+      brief: "Use goal_context and read_goal_review_artifact to inspect the task and actual evidence, then call submit_goal_review with an honest verdict for every criterion. Compare against the original request and all user amendments; report omissions or narrowed requirements as fail or unknown. Do not claim you inspected evidence that is unavailable.",
       level: "ask", delegation: "deny" } };
   },
   log: message => console.error("persistent goals:", message),

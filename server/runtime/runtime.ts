@@ -641,6 +641,13 @@ export class Runtime {
     return !unsettled && !this.store.clientRootHeld(id) && !this.store.clientStopPending(id);
   }
 
+  clientRootStopped(id: string): boolean {
+    const root = this.store.get(id);
+    return this.store.isClientRoot(id) && !!root && isTerminal(root) &&
+      this.store.all({ rootId: id, nonTerminal: true }).length === 0 && !this.store.clientRootHeld(id) && !this.store.clientStopPending(id) &&
+      ![...this.unsettledTurns].some(turn => turn.rootId === id);
+  }
+
   confirmClientRootStopped(id: string, verifyStopped: () => boolean): boolean {
     if (!this.store.isClientRoot(id)) throw new Error("not a client root");
     const root = this.store.get(id);

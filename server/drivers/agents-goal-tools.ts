@@ -11,7 +11,7 @@ const task = { type: "object", properties: { id: text, title: text, brief: text,
 
 export const GOAL_TOOL_ROLES: Record<string, readonly string[]> = {
   goal_context: ["plan", "work", "review"], goal_workspace_for_task: ["plan"], submit_goal_plan: ["plan"], register_goal_artifact: ["work"], submit_goal_task_result: ["work"],
-  list_goal_inputs: ["work"], read_goal_input: ["work"], read_goal_review_artifact: ["review"], submit_goal_review: ["review"],
+  save_goal_checkpoint: ["work"], list_goal_inputs: ["work"], read_goal_input: ["work"], read_goal_review_artifact: ["review"], submit_goal_review: ["review"],
 };
 
 export const GOAL_TOOL_DEFINITIONS = [
@@ -29,6 +29,10 @@ export const GOAL_TOOL_DEFINITIONS = [
     inputSchema: { type: "object", additionalProperties: false, properties: { commandId: text, expectedVersion: version, requirementRevision: version,
       planRevision: version, artifactIds: { type: "array", items: text }, claims: { type: "array", items: claim }, knownIssues: { type: "array", items: { type: "string" } } },
       required: ["commandId", "expectedVersion", "requirementRevision", "planRevision", "artifactIds", "claims", "knownIssues"] } },
+  { name: "save_goal_checkpoint", description: "Save a bounded continuation note, remaining work, blockers and next step. This note is unverified and never counts as acceptance. Read current context first.",
+    inputSchema: { type: "object", additionalProperties: false, properties: { commandId: text, expectedVersion: version, summary: { ...text, maxLength: 4000 },
+      remaining: { type: "array", maxItems: 30, items: { ...text, maxLength: 1000 } }, blockers: { type: "array", maxItems: 20, items: { ...text, maxLength: 1000 } },
+      nextStep: { ...text, maxLength: 2000 } }, required: ["commandId", "expectedVersion", "summary", "remaining", "blockers", "nextStep"] } },
   { name: "list_goal_inputs", description: "List the exact approved predecessor artifact versions available to this task.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} } },
   { name: "read_goal_input", description: "Read an authorized predecessor snapshot in base64 chunks of at most 65536 bytes.",
