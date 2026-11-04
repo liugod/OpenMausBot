@@ -190,6 +190,7 @@ export class RuntimeCoordinator implements Coordinator {
         open: () => this.ready(),
         tick: () => this.tick(),
         enqueueClientRoot: request => this.enqueuePersistentGoal(request),
+        clientRootStopped: id => { this.ready(); return this.runtime.clientRootStopped(id); },
         cancelClientRoot: id => {
           this.ready();
           const settled = this.runtime.cancelClientRoot(id);

@@ -94,6 +94,9 @@ export function createPersistentGoalHost(options: {
     goals,
     budget,
     coordinatorHooks: hooks,
+    canContinueRoot(rootId: string): boolean {
+      return !closed && !!runtimePort && runtimePort.runtime.clientRootStopped?.(rootId) === true;
+    },
     start(coordinator: Coordinator) {
       if (closed) throw new Error("goal service is closed");
       if (scheduler) throw new Error("goal service already started");

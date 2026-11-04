@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { openGoalStore } from "../goals/goal-store.ts";
 import type { RequestAuth } from "../request-auth.ts";
+import { taskChangeSchema } from "../goals/task-continuity.ts";
 import { PASS, type RouteHandler } from "./table.ts";
 
 const name = z.string().trim().min(1).max(200);
@@ -26,6 +27,7 @@ const change = z.strictObject({ expectedVersion: z.number().int().positive(), na
 
 export function createPersistentWorkRoutes(deps: {
   goals: ReturnType<typeof openGoalStore>;
+  confirmStopped?: (rootId: string) => boolean;
   ownerFor: (auth: RequestAuth) => string | undefined;
   createGoal?: (ownerId: string, input: z.infer<typeof createGoal>) => { goalId: string; version: number };
   createItem?: (ownerId: string, input: z.infer<typeof createItem>) => { itemId: string; version: number };
@@ -45,6 +47,21 @@ export function createPersistentWorkRoutes(deps: {
       if (!parsed.success) return json(res, 400, { error: "invalid task" });
       try { return json(res, 201, deps.createChatTask(ownerId, parsed.data)); }
       catch { return json(res, 409, { error: "task could not be created" }); }
+    }
+    const continuation = /^\/api\/persistent-work\/(goals|items)\/([\w:%-]+)\/tasks\/([\w:%-]+)\/(continuation|resume|amend)$/.exec(path);
+    if (continuation && deps.createGoal && deps.createItem && deps.confirmStopped) {
+      const [, kind, encodedGoal, encodedTask, action] = continuation;
+      const goalId = pathId(encodedGoal!), taskId = pathId(encodedTask!);
+      if (!goalId || !taskId) return json(res, 404, { error: "not found" });
+      const standalone = deps.goals.readStandalone(goalId, ownerId);
+      const state = deps.goals.readTaskContinuation(goalId, taskId, ownerId);
+      if (!state || (kind === "items") !== Boolean(standalone)) return json(res, 404, { error: "not found" });
+      if (action === "continuation") return method === "GET" ? json(res, 200, state) : json(res, 405, { error: "method not allowed" });
+      if (method !== "POST") return json(res, 405, { error: "method not allowed" });
+      const input = taskChangeSchema.safeParse(await readBody(req, 16_384));
+      if (!input.success) return json(res, 400, { error: "invalid task update" });
+      try { return json(res, 200, deps.goals.changeTask(input.data, { goalId, taskId, ownerId }, action === "amend" ? "amend" : "resume", deps.confirmStopped)); }
+      catch { return json(res, 409, { error: "task changed, is still running, or its stop is unconfirmed; refresh before retrying" }); }
     }
     const download = /^\/api\/persistent-work\/(goals|items)\/([\w:%-]+)\/artifacts\/([\w:%-]+)$/.exec(path);
     if (download && deps.createGoal && deps.createItem) {
@@ -69,7 +86,7 @@ export function createPersistentWorkRoutes(deps: {
         res.end(text);
         return;
       }
-      const safeName = originalName.replace(/[\x00-\x1f\x7f]/g, "_").slice(0, 180);
+      const safeName = Array.from(originalName, char => char.codePointAt(0)! < 32 || char.codePointAt(0) === 127 ? "_" : char).join("").slice(0, 180);
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(bytes.length),
         "content-disposition": `attachment; filename="artifact"; filename*=UTF-8''${encodeURIComponent(Buffer.from(safeName, "utf8").toString("utf8"))}`,
         "x-content-type-options": "nosniff", "x-omb-sha256": artifact.sha256 });

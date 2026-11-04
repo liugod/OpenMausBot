@@ -1,3 +1,4 @@
+import { GOAL_SCHEMA_VERSION } from "./schema-version.ts";
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
@@ -9,6 +10,7 @@ import { captureArtifact, checkArtifact, checkJsonSchema, inspectArtifact } from
 import { assignDefaultScope, bindWorkThread, createWorkScopeApi, goalScopeActive, migrateWorkScopes } from "./work-scopes.ts";
 import { reviewEvidence } from "./review-evidence.ts";
 import { bindTaskInputs, readInputSnapshot, taskInputsCurrent } from "./task-inputs.ts";
+import { migrateTaskContinuity, taskContinuation, taskRevision, checkpointSchema, taskChangeSchema, affectedTasks, assertTasksStopped, invalidateTaskEvidence } from "./task-continuity.ts";
 import { automaticActionForTask, nextAutomaticAction } from "./automatic-work.ts";
 
 const artifactConfigSchema = z.strictObject({ logicalName: z.string().min(1), minBytes: z.number().int().nonnegative().optional(),
@@ -89,7 +91,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
   db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
   const metadataExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_schema_migrations'").get();
   const currentSchema = metadataExists ? Number(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM goal_schema_migrations").get()?.version) : 0;
-  if (currentSchema > 9) { db.close(); throw new Error("goals.db schema is newer than this build"); }
+  if (currentSchema > GOAL_SCHEMA_VERSION) { db.close(); throw new Error("goals.db schema is newer than this build"); }
   if (path !== ":memory:") db.exec("PRAGMA journal_mode=WAL;");
   db.exec("CREATE TABLE IF NOT EXISTS goal_schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
   try {
@@ -178,6 +180,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
       if (!required.every(name => columns.has(name))) throw new Error(`goals.db contains an unsupported ${table} schema`);
     }
     migrateWorkScopes(db);
+    migrateTaskContinuity(db);
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (1, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (2, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (3, ?)").run(Date.now());
@@ -187,6 +190,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (7, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (8, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (9, ?)").run(Date.now());
+    db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (10, ?)").run(Date.now());
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -277,12 +281,12 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
     return { goalId: String(row.goal_id), ownerId: String(row.owner_id), attemptId: String(row.attempt_id), taskId: String(row.task_id),
       title: String(row.title), request: String(row.original_request), requirementRevision: Number(row.requirement_revision),
       planRevision: Number(row.plan_revision), version: Number(row.version), areaId: String(row.area_id), workstreamId: String(row.workstream_id),
-      standalone: Boolean(row.standalone), task };
+      standalone: Boolean(row.standalone), task, continuation: taskContinuation(db, String(row.goal_id), String(row.task_id)) };
   }
   function reviewContext(context: GoalRunContext, isCurrentRun: (context: GoalRunContext) => boolean) {
     const bound = z.object({ rootId: z.string().min(1), botId: z.string().min(1), threadId: z.string().min(1),
       executionNo: z.number().int().positive() }).parse(context);
-    const row = db.prepare(`SELECT r.*, g.owner_id, g.status AS goal_status, g.version, w.id AS workstream_id, w.area_id,
+    const row = db.prepare(`SELECT r.*, g.owner_id, g.original_request, g.status AS goal_status, g.version, w.id AS workstream_id, w.area_id,
       CASE WHEN c.goal_id IS NULL THEN 0 ELSE 1 END AS standalone FROM goal_review_attempts r
       JOIN goals g ON g.id=r.goal_id JOIN goal_workstreams x ON x.goal_id=g.id AND x.owner_id=g.owner_id
       JOIN work_streams w ON w.id=x.workstream_id AND w.owner_id=x.owner_id
@@ -293,7 +297,9 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
     const evidence = reviewEvidence(db, String(row.goal_id), String(row.task_id));
     if (JSON.stringify(evidence) !== row.evidence_json) throw new Error("review evidence is stale");
     return { goalId: String(row.goal_id), ownerId: String(row.owner_id), attemptId: String(row.id), taskId: String(row.task_id),
-      version: Number(row.version), areaId: String(row.area_id), workstreamId: String(row.workstream_id), standalone: Boolean(row.standalone), evidence };
+      version: Number(row.version), areaId: String(row.area_id), workstreamId: String(row.workstream_id), standalone: Boolean(row.standalone),
+      originalRequest: String(row.original_request), task: taskSchema.parse(JSON.parse(String(readTask.get(String(row.task_id), String(row.goal_id))!.task_json))),
+      evidence };
   }
   function refreshGoalState(goalId: string): void {
     const goal = db.prepare("SELECT status, plan_revision FROM goals WHERE id=?").get(goalId);
@@ -309,6 +315,58 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
   }
   return {
     scopes: createWorkScopeApi(db),
+    saveTaskCheckpoint(input: unknown, context: GoalRunContext, isCurrentRun: (context: GoalRunContext) => boolean) {
+      const value = checkpointSchema.parse(input);
+      const bound = workContext(context, isCurrentRun);
+      return execute("save-checkpoint", { ...value, ownerId: bound.ownerId, attemptId: bound.attemptId }, () => {
+        const current = workContext(context, isCurrentRun);
+        if (current.version !== value.expectedVersion) throw new Error("version conflict");
+        if (Number(db.prepare("SELECT COUNT(*) AS n FROM goal_task_checkpoints WHERE task_id=?").get(bound.taskId)?.n) >= 1000) throw new Error("checkpoint limit reached");
+        const { commandId: _commandId, expectedVersion: _expectedVersion, ...note } = value;
+        db.prepare("INSERT INTO goal_task_checkpoints (goal_id, task_id, attempt_id, task_revision, checkpoint_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(bound.goalId, bound.taskId, bound.attemptId, taskRevision(db, bound.taskId), JSON.stringify(note), Date.now());
+        const version = current.version + 1;
+        setVersion.run(version, bound.goalId);
+        addEvent.run(bound.goalId, "task_checkpoint_saved", version, Date.now());
+        return { goalId: bound.goalId, version };
+      });
+    },
+    readTaskContinuation(goalId: string, taskId: string, ownerId: string) {
+      if (!getGoal.get(goalId, ownerId) || !readTask.get(taskId, goalId)) return undefined;
+      return taskContinuation(db, goalId, taskId);
+    },
+    changeTask(input: unknown, identity: { goalId: string; taskId: string; ownerId: string }, kind: "resume" | "amend",
+      confirmStopped: (rootId: string) => boolean) {
+      const value = taskChangeSchema.parse(input);
+      return execute(`task-${kind}`, { ...value, ...identity }, () => {
+        const { goalId, taskId, ownerId } = identity;
+        const goal = getGoal.get(goalId, ownerId), row = readTask.get(taskId, goalId);
+        if (!goal || !row || Number(goal.version) !== value.expectedVersion || !["active", "blocked", "waiting_user"].includes(String(goal.status)) ||
+          !goalScopeActive(db, goalId) || row.plan_revision !== goal.plan_revision) throw new Error("task or scope is unavailable or version conflict");
+        if (kind === "resume" && row.status !== "blocked") throw new Error("only blocked tasks can resume");
+        if (["cancelled", "superseded"].includes(String(row.status))) throw new Error("task is closed");
+        const affected = affectedTasks(db, goalId, taskId);
+        assertTasksStopped(db, goalId, affected, confirmStopped);
+        if (kind === "amend") {
+          const task = taskSchema.parse(JSON.parse(String(row.task_json)));
+          const brief = `${task.brief}\n\nUser amendment: ${value.instruction}`;
+          if (brief.length > 32000) throw new Error("task brief exceeds amendment limit");
+          task.brief = brief;
+          task.criteria.push({ id: `amendment-${taskRevision(db, taskId) + 1}`, required: true, kind: "lead_review",
+            description: `Verify user amendment: ${value.instruction}`, config: {} });
+          if (task.criteria.length > 200 || new Set(task.criteria.map(c => c.id)).size !== task.criteria.length) throw new Error("amendment criterion limit or conflict");
+          db.prepare("UPDATE goal_tasks SET task_json=? WHERE id=? AND goal_id=?").run(JSON.stringify(task), taskId, goalId);
+        }
+        for (const id of affected) {
+          invalidateTaskEvidence(db, goalId, id);
+          db.prepare("INSERT INTO goal_task_changes (goal_id, task_id, kind, instruction, created_at) VALUES (?, ?, ?, ?, ?)")
+            .run(goalId, id, id === taskId ? kind : "dependency_changed", id === taskId ? value.instruction : `Upstream task ${taskId} changed; recheck dependent work.`, Date.now());
+        }
+        const version = Number(goal.version) + 1;
+        setVersion.run(version, goalId); refreshGoalState(goalId); addEvent.run(goalId, `task_${kind}`, version, Date.now());
+        return { goalId, version, taskId, affectedTaskIds: affected };
+      });
+    },
     createStandalone(input: z.input<typeof standaloneSchema>) {
       const value = standaloneSchema.parse(input);
       const fingerprint = createHash("sha256").update(JSON.stringify({ ownerId: value.ownerId, workstreamId: value.workstreamId,
@@ -354,9 +412,11 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
       if (!row) return undefined;
       return { workstreamId: String(row.workstream_id), ...(row.routine_id === null ? {} : { routineId: String(row.routine_id), occurrenceKey: String(row.occurrence_key) }),
         ...(row.budget_period === null ? {} : { budgetPeriod: String(row.budget_period) }), status: String(row.status), version: Number(row.version),
-        task: { ...taskSchema.parse(JSON.parse(String(row.task_json))), status: String(row.task_status) },
+        task: { ...taskSchema.parse(JSON.parse(String(row.task_json))), continuation: taskContinuation(db, containerId, String(row.task_id)), status: String(row.task_status) },
         artifacts: db.prepare(`SELECT a.id, a.logical_name AS logicalName, a.bytes, a.sha256 FROM goal_artifacts a
-          JOIN goal_artifact_snapshots s ON s.artifact_id=a.id WHERE a.goal_id=? AND a.task_id=? ORDER BY a.logical_name, a.revision`).all(containerId, String(row.task_id)) };
+          JOIN goal_artifact_snapshots s ON s.artifact_id=a.id WHERE a.goal_id=? AND a.task_id=?
+            AND EXISTS (SELECT 1 FROM goal_tasks t WHERE t.id=a.task_id AND t.status='succeeded')
+            AND a.revision=(SELECT MAX(v.revision) FROM goal_artifacts v WHERE v.task_id=a.task_id AND v.logical_name=a.logical_name) ORDER BY a.logical_name, a.revision`).all(containerId, String(row.task_id)) };
     },
     create(input: GoalCreate) {
       const value = createSchema.parse(input);
@@ -642,7 +702,9 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
     readArtifactSnapshot(input: { goalId: string; ownerId: string; artifactId: string }) {
       const value = z.strictObject({ goalId: z.string().min(1), ownerId: z.string().min(1), artifactId: z.string().min(1) }).parse(input);
       const row = db.prepare(`SELECT s.contents, s.sha256, s.bytes FROM goal_artifact_snapshots s JOIN goal_artifacts a ON a.id=s.artifact_id
-        JOIN goals g ON g.id=a.goal_id WHERE g.id=? AND g.owner_id=? AND a.id=?`).get(value.goalId, value.ownerId, value.artifactId);
+        JOIN goals g ON g.id=a.goal_id JOIN goal_tasks t ON t.id=a.task_id AND t.goal_id=g.id
+        WHERE g.id=? AND g.owner_id=? AND a.id=? AND t.status='succeeded'
+        AND a.revision=(SELECT MAX(v.revision) FROM goal_artifacts v WHERE v.task_id=a.task_id AND v.logical_name=a.logical_name)`).get(value.goalId, value.ownerId, value.artifactId);
       if (!row) return undefined;
       const bytes = Buffer.from(row.contents as Uint8Array);
       if (bytes.length !== Number(row.bytes) || createHash("sha256").update(bytes).digest("hex") !== row.sha256) throw new Error("artifact snapshot is corrupted");
@@ -958,7 +1020,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
           AND NOT EXISTS (SELECT 1 FROM goal_attempts a WHERE a.task_id=t.id AND a.status IN ('prepared','queued','running','waiting','reconciling'))
         ORDER BY g.id, t.id LIMIT ?`).all(workstreamId, workstreamId, afterGoalId, afterGoalId, afterTaskId, limit);
       return rows.map(row => ({ goalId: String(row.goal_id), ownerId: String(row.owner_id), version: Number(row.version), workstreamId: String(row.workstream_id),
-        planRevision: Number(row.plan_revision), task: taskSchema.parse(JSON.parse(String(row.task_json))) }));
+        planRevision: Number(row.plan_revision), taskRevision: taskRevision(db, taskSchema.parse(JSON.parse(String(row.task_json))).id), task: taskSchema.parse(JSON.parse(String(row.task_json))) }));
     },
     auditStaleInputs(afterGoalId: string, afterTaskId: string, limit: number) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid input audit batch size");
@@ -1054,7 +1116,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
         tasks: readTasks.all(goalId).map(row => {
           const task = taskSchema.parse(JSON.parse(String(row.task_json)));
           const blocker = db.prepare("SELECT code FROM goal_task_blockers WHERE task_id=?").get(task.id);
-          return { ...task, status: String(row.status), ...(blocker ? { blocker: String(blocker.code) } : {}) };
+          return { ...task, continuation: taskContinuation(db, goalId, task.id), status: String(row.status), ...(blocker ? { blocker: String(blocker.code) } : {}) };
         }),
         artifacts: readArtifacts.all(goalId).map(row => ({ id: String(row.id), taskId: String(row.task_id), attemptId: String(row.attempt_id),
           logicalName: String(row.logical_name), revision: Number(row.revision), reference: String(row.reference), sha256: String(row.sha256),

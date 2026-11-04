@@ -70,7 +70,7 @@ export function createGoalScheduler(deps: {
                 const prepared = deps.prepareReadyWork(candidate);
                 if (!prepared) continue;
                 deps.goals.prepareWork({ ownerId: candidate.ownerId, goalId: candidate.goalId, taskId: candidate.task.id,
-                  commandId: `auto-work:${candidate.task.id}:plan:${candidate.planRevision}`, expectedVersion: candidate.version, intent: prepared.intent },
+                  commandId: `auto-work:${candidate.task.id}:plan:${candidate.planRevision}:task:${candidate.taskRevision}`, expectedVersion: candidate.version, intent: prepared.intent },
                 prepared.resolveWritableWorkspace);
                 break;
               } catch { deps.log("goal ready-work preparation failed"); }

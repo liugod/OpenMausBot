@@ -56,6 +56,7 @@ export function createGoalToolDispatcher(deps: {
         resolveAuthorizedRoots: workspace => deps.resolveAuthorizedRoots(context, workspace), allowVersionAdvance });
       if (name === "goal_context") { empty.parse(input); const result = tools.getGoalContext(); remember(context, role, result.version); return result; }
       if (name === "register_goal_artifact") { const result = await tools.registerArtifact(input); remember(context, role, result.version); return result; }
+      if (name === "save_goal_checkpoint") { const result = tools.saveCheckpoint(input); remember(context, role, result.version); return result; }
       if (name === "submit_goal_task_result") return tools.submitTaskResult(input);
       if (name === "list_goal_inputs") { empty.parse(input); return tools.listInputs(); }
       if (name === "read_goal_input") return tools.readInput(input);

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { PersistentTaskContinuation } from "./PersistentTaskContinuation";
 import { FileText, X } from "lucide-react";
 
 type Work = { taskId: string; title: string; status: string; assigneeBotId: string; sourceThreadId?: string; itemId?: string; goalId?: string };
-type Artifact = { id: string; logicalName: string; taskId?: string };
+type Artifact = { id: string; logicalName: string; taskId?: string; revision?: number };
 const labels: Record<string, string> = { planned: "待执行", ready: "排队中", running: "执行中", checking: "检查与复核", succeeded: "已完成", blocked: "受阻", waiting_user: "需要你", cancelled: "已取消" };
 const routeId = (value: string) => encodeURIComponent(value).replace(/%3A/gi, ":");
 const workPath = (work: Work) => `/api/persistent-work/${work.itemId ? "items" : "goals"}/${routeId(work.itemId ?? work.goalId ?? "")}`;
@@ -55,7 +56,8 @@ export function PersistentWorkChat({ botId, threadId, panel = false }: { botId: 
       if (seq !== requestSeq.current) return;
       const taskStatus = item.itemId ? result.task?.status : result.tasks?.find(task => task.id === item.taskId)?.status;
       if (taskStatus !== "succeeded") throw new Error("任务状态已变化，请刷新后查看。");
-      const approved = (result.artifacts ?? []).filter(file => !file.taskId || file.taskId === item.taskId);
+      const candidates = (result.artifacts ?? []).filter(file => !file.taskId || file.taskId === item.taskId);
+      const approved = candidates.filter(file => !candidates.some(other => other.logicalName === file.logicalName && (other.revision ?? 0) > (file.revision ?? 0)));
       setFiles(approved);
       if (!approved.length) throw new Error("暂时没有可查看的成果文件。");
       const response = await fetch(`${workPath(item)}/artifacts/${encodeURIComponent(approved[0]!.id)}?preview=1`);
@@ -74,6 +76,8 @@ export function PersistentWorkChat({ botId, threadId, panel = false }: { botId: 
       <ul className="space-y-2">{(showAll ? items : items.slice(-3)).map(item => <li key={item.taskId} className="flex flex-wrap items-center gap-2">
         <span className="min-w-0 flex-1 truncate">{item.title}</span><span className="text-xs text-ink-secondary">{labels[item.status] ?? item.status}</span>
         {item.status === "succeeded" && (item.itemId || item.goalId) && <button type="button" className="rounded-md px-2 py-1 text-accent hover:bg-raised" onClick={() => void open(item)}>查看报告</button>}
+        {["succeeded", "blocked"].includes(item.status) && (item.itemId || item.goalId) && <PersistentTaskContinuation path={workPath(item)} taskId={item.taskId}
+          blocked={item.status === "blocked"} onChanged={() => { void refresh(); window.dispatchEvent(new Event("persistent-work-changed")); }} />}
       </li>)}</ul>
       {items.length > 3 && <button type="button" className="mt-2 text-xs text-accent" onClick={() => setShowAll(!showAll)}>{showAll ? "收起任务" : `显示全部 ${items.length} 项`}</button>}
     </section>;

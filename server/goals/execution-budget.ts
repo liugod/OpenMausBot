@@ -1,3 +1,4 @@
+import { GOAL_SCHEMA_VERSION } from "./schema-version.ts";
 import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -59,7 +60,7 @@ export function openExecutionBudgetStore(path: string): ExecutionBudgetStore {
   db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   const metadataExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_schema_migrations'").get();
   const currentSchema = metadataExists ? Number(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM goal_schema_migrations").get()?.version) : 0;
-  if (currentSchema > 9) { db.close(); throw new Error("goals.db schema is newer than this build"); }
+  if (currentSchema > GOAL_SCHEMA_VERSION) { db.close(); throw new Error("goals.db schema is newer than this build"); }
   if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS goal_execution_budgets (
