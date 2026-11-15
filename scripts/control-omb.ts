@@ -2,7 +2,7 @@
 // The openmausbot headless verbs for verifying an isolated fixture. A verb that
 // changes something never runs on a server it merely found.
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -163,6 +163,13 @@ export function verificationServerEnvironment(parentEnv: NodeJS.ProcessEnv, data
     // login shell's PATH, finding a developer's own engine CLIs that CI lacks.
     OMB_TEST_SEALED_PATH: "1",
   });
+  if (parentEnv.OMB_TEST_GSD_BRIDGE === "1") {
+    childEnv.OMB_GSD_STATE_DIR = join(dataDir, "gsd-integration");
+    if (parentEnv.OMB_GSD_GIT && existsSync(parentEnv.OMB_GSD_GIT)) {
+      childEnv.OMB_GSD_GIT = parentEnv.OMB_GSD_GIT;
+      childEnv.OMB_EXTRA_PATH = [dirname(parentEnv.OMB_GSD_GIT), ...(process.platform === "win32" ? [join(childEnv.SYSTEMROOT || "C:\\Windows", "System32")] : [])].join(delimiter);
+    }
+  }
   // The fake engines' knobs are the one thing a caller may script into the child.
   for (const [key, value] of Object.entries(parentEnv)) {
     // FAKE_CLAUDE_DUMP stays the launcher's: assertions read fixtureDumpPath.

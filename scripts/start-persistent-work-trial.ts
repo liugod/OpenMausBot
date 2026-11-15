@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, openSync, closeSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, openSync, closeSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -25,6 +25,15 @@ if (!existsSync(authCopy)) { copyFileSync(auth, authCopy); try { chmodSync(authC
 const config = join(dataDir, "config.json");
 if (!existsSync(config)) writeFileSync(config, JSON.stringify({ features: { smartSetupChoices: false }, instances: { codex: { driver: "codex", displayName: "Codex", config: { cli: executable } } } }, null, 2));
 const env = verificationServerEnvironment({ ...process.env, OMB_PERSISTENT_WORK_PREVIEW: "1", OMB_PERSISTENT_WORK_RUNTIME_TEST: "1", OMB_VERIFY_ALLOW_PROXY: "1", OMB_DEV_TRUST_LOCAL_BROWSER: "0" }, dataDir, serverPort);
+const gsdConfig = join(root, "..", "gsd-local", "openmaus-bridge-config.json");
+if (existsSync(gsdConfig)) {
+  try {
+    const gitExecutable = (JSON.parse(readFileSync(gsdConfig, "utf8")) as { gitExecutable?: unknown }).gitExecutable;
+    if (typeof gitExecutable === "string" && isAbsolute(gitExecutable) && existsSync(gitExecutable)) {
+      env.OMB_EXTRA_PATH = [dirname(gitExecutable), ...(process.platform === "win32" ? [join(env.SYSTEMROOT || "C:\\Windows", "System32")] : [])].join(delimiter);
+    }
+  } catch { console.warn("GSD Git configuration could not be read; GSD may be unavailable."); }
+}
 const log = openSync(join(dataDir, "server.log"), "a", 0o600);
 const child = spawn(process.execPath, verificationServerArgs(env), { cwd: root, env, stdio: ["ignore", log, log], windowsHide: true });
 closeSync(log);
