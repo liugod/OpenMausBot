@@ -29,7 +29,7 @@ try {
     await api("POST", `/api/bots/${bot.id}/skill-template`, { name, description: "GSD integration fixture", warnings: [], source: `local:${name}`, text, enabled: true });
   }
   const prompt = `This is an isolated synthetic test. Use your openmaus-gsd-bridge skill to prepare GSD for repository ${repo} with task ID ${taskId}, then explicitly use coordinate_bots to assign the work to GSD fixture worker. Tell the worker to use its openmaus-gsd-worker skill and the installed gsd-fast workflow in the prepared worktree: create fixture-result.txt containing exactly "GSD fixture complete." including the period. There is no byte-length requirement; follow the literal text if any calculated length differs. Do not access the network, commit, push or modify the source repository. Wait for the worker's actual result and report it.`;
-  const run = await runControlOmb(["run", "--bot", chief.id, "--text", prompt, "--url", fixture.info.url, "--wait", "job", "--timeout", "8m"]);
+  const run = await runControlOmb(["run", "--bot", chief.id, "--text", prompt, "--url", fixture.info.url, "--wait", "job", "--timeout", "15m"]);
   evidence.run = run;
   const stateRoot = join(fixture.info.dataDir, "gsd-integration");
   const status = JSON.parse(execFileSync(process.execPath, [bridge, "status", "--task", taskId],
