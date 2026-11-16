@@ -9,7 +9,9 @@ if (testBase && !/^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/.test(testBase)) throw ne
 const base = testBase || "http://127.0.0.1:19753";
 const bridge = join(root, "scripts", "gsd-bridge.mjs");
 const goal = join(root, "scripts", "gsd-create-goal.ts");
-const previousChiefHash = "a3dd4f7c36f8868aaa7307e287a9ac944f8cfb7f93387d005ecd46034651699e";
+const control = join(root, "scripts", "gsd-control.ts");
+const previousHashes = { "openmaus-gsd-bridge": ["a3dd4f7c36f8868aaa7307e287a9ac944f8cfb7f93387d005ecd46034651699e", "14362880eb2eb3816753025fb9b1fc0e36ed3ed0306c50e0861a35cb06896def"],
+  "openmaus-gsd-worker": ["b5b23d97540d6126edda348ded354d7faeee6bae998ad87d1b16c694d1a1032b"] };
 async function api(path, options) {
   const response = await fetch(`${base}${path}`, { ...options, signal: AbortSignal.timeout(15_000) });
   if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
@@ -32,7 +34,7 @@ try {
   const targets = [{ bot: chiefs[0], name: "openmaus-gsd-bridge" }, { bot: workers[0], name: "openmaus-gsd-worker" }];
   for (const target of targets) {
     if (target.bot.busy) throw new Error(`${target.bot.name} is busy; retry after this turn finishes`);
-    target.text = readFileSync(join(root, "skills", target.name, "SKILL.md"), "utf8").replaceAll("{{OMB_GSD_BRIDGE}}", bridge).replaceAll("{{OMB_GSD_GOAL}}", goal);
+    target.text = readFileSync(join(root, "skills", target.name, "SKILL.md"), "utf8").replaceAll("{{OMB_GSD_BRIDGE}}", bridge).replaceAll("{{OMB_GSD_GOAL}}", goal).replaceAll("{{OMB_GSD_CONTROL}}", control);
     const listing = await api(`/api/bots/${encodeURIComponent(target.bot.id)}/skills`);
     const found = listing.skills?.find(skill => skill.name === target.name);
     if (found) {
@@ -40,8 +42,8 @@ try {
       if (!found.enabled) throw new Error(`${target.name} is disabled; preserving it`);
       if (current.text === target.text) target.exists = true;
       else {
-        const previous = current.text.replaceAll(bridge, "{{OMB_GSD_BRIDGE}}");
-        if (target.name !== "openmaus-gsd-bridge" || createHash("sha256").update(previous).digest("hex") !== previousChiefHash) throw new Error(`${target.name} has different contents; preserving it`);
+        const previous = current.text.replaceAll(bridge, "{{OMB_GSD_BRIDGE}}").replaceAll(goal, "{{OMB_GSD_GOAL}}");
+        if (!previousHashes[target.name].includes(createHash("sha256").update(previous).digest("hex"))) throw new Error(`${target.name} has different contents; preserving it`);
         target.previous = current.text;
       }
     }

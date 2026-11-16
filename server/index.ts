@@ -23,6 +23,7 @@ import { botMemoryFiles, createLendingMemory } from "./lending-memory.ts";
 import { SharedComputerControl } from "./shared-computer-control.ts";
 import { createCoordinator, type ComposedTurn, type CoordinateBotsCall, type Coordinator, type HandoffOpener, type HandoffOptions, type HandoffView, type HostTurnResult } from "./coordinator.ts";
 import { openGoalStore } from "./goals/goal-store.ts";
+import { openGsdControl } from "./goals/gsd-control.ts";
 import { createPersistentGoalHost } from "./goals/host-service.ts";
 import { createGoalWorkspaces, goalWorkspaceRef, parseGoalWorkspaceRef } from "./goals/workspace-refs.ts";
 import { createPersistentWorkRoutes } from "./routes/persistent-work.ts";
@@ -14086,7 +14087,23 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             const opener = (room ? null : handOnFor) ?? openerFrom(address.threadId);
             const continued = room || fresh ? undefined : workThreadFor(store, { botId: target.botId, botName: recipient.name, fromBotId: internalSender.id, fromThreadId: address.threadId, thread: call.thread,
               also: (task) => !CLOUD_TEAM || threadStarters.get(task.threadId) === opener });
-            const relayed = EXTERNAL || (!call.answers && (room || fresh || mode === "consult")) ? undefined : await questionRouting.relay({ sender: internalSender, senderThreadId: address.threadId,
+            const taskMarker = /\[\[OMB-GSD:([A-Za-z0-9][A-Za-z0-9_-]{0,79})\]\]/.exec(call.message)?.[1];
+            const commandMarker = /\[\[OMB-GSD-CMD:([A-Za-z0-9][A-Za-z0-9_-]{0,79})\]\]/.exec(call.message)?.[1];
+            if (fixtureGoalHost && taskMarker && !commandMarker && (!fresh || room || targets.length !== 1)) throw new Error("GSD work requires a new direct worker thread");
+            let gsdControlKind: string | undefined;
+            if (fixtureGoalHost && taskMarker && commandMarker) {
+              if (!continued || room || targets.length !== 1) throw new Error("GSD control must use its registered worker thread");
+              const gsd = openGsdControl(DATA_DIR);
+              try { gsdControlKind = gsd.claimDelivery({ taskId: taskMarker, ownerId: "local-owner", commandId: commandMarker,
+                chiefId: internalSender.id, botId: target.botId, threadId: continued.threadId, message: call.message }).kind; }
+              finally { gsd.close(); }
+              if (gsdControlKind === "conflict") throw new Error("GSD planning files changed; review before sending the change");
+            }
+            if (gsdControlKind === "pause" && continued && threadBusy(target.botId, continued.threadId) && canSteerThread(continued.threadId)) {
+              await steerThread(continued.threadId, `The person requested a pause ${commandMarker}. At the next safe checkpoint, stop starting new work and end this turn. A separate queued request will create the GSD handoff. Do not start another assignment.`);
+              requireActiveInternalCapability();
+            }
+            const relayed = gsdControlKind || EXTERNAL || (!call.answers && (room || fresh || mode === "consult")) ? undefined : await questionRouting.relay({ sender: internalSender, senderThreadId: address.threadId,
               senderNode: coordinator.node(internalCapability.roomHandoffId ?? generation), target: recipient, message: call.message, ...(call.answers ? { answers: call.answers } : {}), ...(continued ? { threadId: continued.threadId } : {}),
               ...(internalCapability.delegatedThisTurn ? { sentThisTurn: internalCapability.delegatedThisTurn } : {}) });
             if (relayed) { if (relayed.outcome === "failed") refused.push(relayed.detail); receipts.push(relayed); continue; }
@@ -14105,6 +14122,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               delegatedLevel.apply(internalSender, internalCapability.threadId, internalCapability.roomHandoffId ?? generation, recipient, target.threadId);
             }
             const routed = lane ? { botId: target.botId, threadId: lane.threadId } : target;
+            if (fixtureGoalHost && taskMarker && !commandMarker) {
+              if (room || targets.length !== 1) throw new Error("GSD work must use one direct worker");
+              const gsd = openGsdControl(DATA_DIR);
+              try {
+                const current = gsd.inspect(taskMarker, "local-owner");
+                if (current.chiefId !== internalSender.id) throw new Error("GSD work belongs to another chief");
+                if (current.run) throw new Error("GSD task already has an assignment; inspect it before starting another");
+              } finally { gsd.close(); }
+            }
             const { node, duplicate } = coordinator.enqueue(address, generation, internalCapability.roomHandoffId, routed, call.message, {
               mode, reply, thread: lane || fresh ? "new" : "standing", approvalGranted, rework: call.rework, ...(lane ? {} : { requestBatchKey }),
               ...(call.doneWhen ? { doneWhen: call.doneWhen } : {}),
@@ -14123,17 +14149,30 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             };
             const notSent = duplicate && finished[node.status] ? `not sent again: ${finished[node.status]}` : undefined;
             if (notSent) refused.push(notSent);
+            let gsdNote = "";
+            const gsdTask = /\[\[OMB-GSD:([A-Za-z0-9][A-Za-z0-9_-]{0,79})\]\]/.exec(call.message)?.[1];
+            const gsdCommand = /\[\[OMB-GSD-CMD:([A-Za-z0-9][A-Za-z0-9_-]{0,79})\]\]/.exec(call.message)?.[1];
+            if (!notSent && fixtureGoalHost && gsdTask && !room && targets.length === 1) {
+              try {
+                const gsd = openGsdControl(DATA_DIR);
+                try {
+                  if (gsdCommand) gsd.attach({ taskId: gsdTask, ownerId: "local-owner", commandId: gsdCommand, assignmentId: node.id });
+                  else gsd.registerRun({ taskId: gsdTask, ownerId: "local-owner", assignmentId: node.id });
+                } finally { gsd.close(); }
+                gsdNote = " GSD assignment recorded.";
+              } catch { gsdNote = " GSD assignment was sent but its control record could not be saved; inspect before retry."; }
+            }
             receipts.push(peerDeliveryReceipt({
               botId: node.botId,
               botName: recipient.name,
               outcome: notSent ? "failed" : !duplicate || node.status === "queued" ? "queued" : "injected",
-              detail: notSent ?? (duplicate
+              detail: (notSent ?? (duplicate
                 ? `already sent: it is ${node.status === "queued" ? "queued" : "under way"} and ${returns}`
                 : lane
                   ? `runs in its own thread "${lane.title}", in parallel with the other room jobs; its result posts in this room and ${returns}`
                   : title
                     ? `${outsideRoomNote(addressedRoom, via)}sent to "${title}"; it runs after anything still running there`
-                    : "handed to the coordinator; the teammate's turn has not started yet"),
+                    : "handed to the coordinator; the teammate's turn has not started yet")) + gsdNote,
               requestId: node.id,
               ...(via === "room" ? {} : { threadId: node.threadId }),
             }));

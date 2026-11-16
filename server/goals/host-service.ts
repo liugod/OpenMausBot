@@ -7,6 +7,7 @@ import { openGoalStore } from "./goal-store.ts";
 import { createGoalScheduler } from "./scheduler.ts";
 import { createGoalToolDispatcher } from "./tool-dispatch.ts";
 import { syncGsdGoals } from "./gsd-sync.ts";
+import { openGsdControl } from "./gsd-control.ts";
 import type { GoalRunContext } from "./goal-store.ts";
 import type { GoalRuntimePort } from "./runtime-port.ts";
 
@@ -49,6 +50,8 @@ export function createPersistentGoalHost(options: {
   function syncGsd() {
     if (closed || gsdProcessing || Date.now() - lastGsdSync < 15_000) return;
     lastGsdSync = Date.now();
+    try { const control = openGsdControl(options.dataDir); try { control.reconcileSent(); } finally { control.close(); } }
+    catch { options.log("GSD control reconciliation deferred"); }
     gsdProcessing = syncGsdGoals(options.dataDir, goals).catch(() => options.log("GSD goal sync failed"))
       .finally(() => { gsdProcessing = undefined; });
   }

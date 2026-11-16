@@ -89,7 +89,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
   db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
   const metadataExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_schema_migrations'").get();
   const currentSchema = metadataExists ? Number(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM goal_schema_migrations").get()?.version) : 0;
-  if (currentSchema > 11) { db.close(); throw new Error("goals.db schema is newer than this build"); }
+  if (currentSchema > 12) { db.close(); throw new Error("goals.db schema is newer than this build"); }
   if (path !== ":memory:") db.exec("PRAGMA journal_mode=WAL;");
   db.exec("CREATE TABLE IF NOT EXISTS goal_schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
   try {
@@ -157,6 +157,15 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
       logical_name TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(attempt_id, artifact_id));
     CREATE TABLE IF NOT EXISTS goal_gsd_links (task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL UNIQUE REFERENCES goals(id),
       owner_id TEXT NOT NULL, snapshot_json TEXT, synced_at INTEGER, error TEXT, viewer_bot_id TEXT);
+    CREATE TABLE IF NOT EXISTS goal_gsd_runs (task_id TEXT PRIMARY KEY REFERENCES goal_gsd_links(task_id), assignment_id TEXT NOT NULL UNIQUE,
+      bot_id TEXT NOT NULL, thread_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS goal_gsd_commands (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES goal_gsd_links(task_id),
+      owner_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('change','pause','resume')), request TEXT NOT NULL, fingerprint TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','dispatching','delivering','sent','applied','conflict','uncertain','cancelled')), assignment_id TEXT,
+      baseline_json TEXT NOT NULL, result_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS goal_gsd_commands_task ON goal_gsd_commands(task_id,created_at);
+    CREATE TABLE IF NOT EXISTS goal_gsd_command_events (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      command_id TEXT NOT NULL REFERENCES goal_gsd_commands(id), kind TEXT NOT NULL, detail_json TEXT NOT NULL, created_at INTEGER NOT NULL);
     INSERT OR IGNORE INTO goal_pause_state (goal_id, previous_status)
       SELECT id, CASE WHEN plan_revision=0 THEN 'planning' ELSE 'active' END FROM goals WHERE status='paused';
     `);
@@ -192,6 +201,7 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (9, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (10, ?)").run(Date.now());
     db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (11, ?)").run(Date.now());
+    db.prepare("INSERT OR IGNORE INTO goal_schema_migrations (version, applied_at) VALUES (12, ?)").run(Date.now());
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -1087,7 +1097,8 @@ export function openGoalStore(path: string, options: { unsafeTestPlanBootstrap?:
         areaId: String(scope?.area_id), workstreamId: String(scope?.workstream_id),
         leadBotId: String(goal.lead_bot_id), leadThreadId: String(goal.lead_thread_id),
         status: String(goal.status), requirementRevision: Number(goal.requirement_revision), planRevision: Number(goal.plan_revision),
-        version: Number(goal.version), gsd: (() => { const row = db.prepare("SELECT task_id, snapshot_json, synced_at, error FROM goal_gsd_links WHERE goal_id=? AND owner_id=?").get(goalId, ownerId); return row ? { taskId: String(row.task_id), snapshot: row.snapshot_json ? JSON.parse(String(row.snapshot_json)) as unknown : null, syncedAt: row.synced_at ? Number(row.synced_at) : null, error: row.error ? String(row.error) : null } : undefined; })(), stopPending: Boolean(db.prepare(`SELECT 1 FROM goal_stop_outbox WHERE goal_id=? AND state='pending'
+        version: Number(goal.version), gsd: (() => { const row = db.prepare("SELECT task_id, snapshot_json, synced_at, error FROM goal_gsd_links WHERE goal_id=? AND owner_id=?").get(goalId, ownerId); return row ? { taskId: String(row.task_id), snapshot: row.snapshot_json ? JSON.parse(String(row.snapshot_json)) as unknown : null, syncedAt: row.synced_at ? Number(row.synced_at) : null, error: row.error ? String(row.error) : null,
+          controls: db.prepare("SELECT id,kind,state,created_at AS createdAt FROM goal_gsd_commands WHERE task_id=? AND owner_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 20").all(String(row.task_id), ownerId) } : undefined; })(), stopPending: Boolean(db.prepare(`SELECT 1 FROM goal_stop_outbox WHERE goal_id=? AND state='pending'
           UNION ALL SELECT 1 FROM goal_management_stop_outbox WHERE goal_id=? AND state='pending'
           UNION ALL SELECT 1 FROM goal_review_stop_outbox WHERE goal_id=? AND state='pending' LIMIT 1`).get(goalId, goalId, goalId)),
         managementAttempts: db.prepare("SELECT id, kind, root_id, status FROM goal_management_attempts WHERE goal_id=? ORDER BY created_at, rowid").all(goalId)

@@ -128,7 +128,8 @@ export function createWorkScopeApi(db: DatabaseSync) {
       return [...items, ...gsd.map(row => ({ taskId: `gsd:${String(row.task_id)}`, title: String(row.title), assigneeBotId: String(row.lead_bot_id),
         status: "gsd", areaId: String(row.area_id), workstreamId: String(row.workstream_id), goalId: String(row.goal_id),
         gsd: { taskId: String(row.task_id), snapshot: row.snapshot_json ? JSON.parse(String(row.snapshot_json)) as unknown : null,
-          syncedAt: row.synced_at ? Number(row.synced_at) : null, error: row.error ? String(row.error) : null } }))];
+          syncedAt: row.synced_at ? Number(row.synced_at) : null, error: row.error ? String(row.error) : null,
+          controls: db.prepare("SELECT id,kind,state,created_at AS createdAt FROM goal_gsd_commands WHERE task_id=? AND owner_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 1").all(String(row.task_id), ownerId) } }))];
     },
     budgets(ownerId: string) {
       id.parse(ownerId);

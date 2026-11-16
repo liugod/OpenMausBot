@@ -3,11 +3,12 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FileText, X } from "lucide-react";
 
-type GsdProgress = { syncedAt: number | null; error: string | null; snapshot: null | { planning: boolean; scope?: string; phases: { number: string; name: string; disk_status: string }[]; completed_phases?: number; phase_count?: number } };
+type GsdProgress = { syncedAt: number | null; error: string | null; controls?: { id: string; kind: string; state: string }[]; snapshot: null | { planning: boolean; scope?: string; phases: { number: string; name: string; disk_status: string }[]; completed_phases?: number; phase_count?: number } };
 type Work = { taskId: string; title: string; status: string; assigneeBotId: string; sourceThreadId?: string; itemId?: string; goalId?: string; gsd?: GsdProgress };
 type Artifact = { id: string; logicalName: string; taskId?: string };
 const labels: Record<string, string> = { planned: "待执行", ready: "排队中", running: "执行中", checking: "检查与复核", succeeded: "已完成", blocked: "受阻", waiting_user: "需要你", cancelled: "已取消", gsd: "GSD 阶段" };
 const gsdLabels: Record<string, string> = { no_directory: "待开始", empty: "待开始", discussed: "已讨论", researched: "已研究", planned: "已规划", partial: "进行中", executed: "已执行，待确认", complete: "阶段完成" };
+const controlLabels: Record<string, string> = { pending: "已记录，待发送", dispatching: "正在准备发送", delivering: "正在发送", sent: "已发送，等待助手处理", applied: "已处理", conflict: "计划有变动，需核对", uncertain: "结果待核对", cancelled: "已取消" };
 const routeId = (value: string) => encodeURIComponent(value).replace(/%3A/gi, ":");
 const workPath = (work: Work) => `/api/persistent-work/${work.itemId ? "items" : "goals"}/${routeId(work.itemId ?? work.goalId ?? "")}`;
 
@@ -77,6 +78,7 @@ export function PersistentWorkChat({ botId, threadId, panel = false }: { botId: 
         <span className="min-w-0 flex-1 truncate">{item.title}</span><span className="text-xs text-ink-secondary">{labels[item.status] ?? item.status}</span>
         {item.status === "succeeded" && (item.itemId || item.goalId) && <button type="button" className="rounded-md px-2 py-1 text-accent hover:bg-raised" onClick={() => void open(item)}>查看报告</button>}
         {item.gsd && <div className="basis-full text-xs leading-5 text-ink-secondary">
+          {item.gsd.controls?.slice(0, 1).map(command => <p key={command.id}>{({ pause: "暂停", resume: "继续", change: "需求变更" } as Record<string, string>)[command.kind] ?? command.kind}：{command.kind === "resume" && command.state === "applied" ? "助手已启动，GSD 恢复待核对" : controlLabels[command.state] ?? command.state}{command.kind === "pause" && command.state === "applied" ? "（助手已停止；外部后台任务未核实）" : ""}</p>)}
           {item.gsd.error && <p role="status">同步暂时失败，显示最近一次记录。</p>}
           {!item.gsd.snapshot ? <p>等待同步阶段信息。</p> : !item.gsd.snapshot.planning ? <p>尚未建立 GSD 阶段计划。</p> : <>
             <p>阶段进度：{item.gsd.snapshot.completed_phases ?? 0}/{item.gsd.snapshot.phase_count ?? 0}；不代表目标已验收。</p>
