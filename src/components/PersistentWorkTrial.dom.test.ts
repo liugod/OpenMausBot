@@ -52,7 +52,19 @@ it("shows completed work first and loads its approved file with the correct item
     const button = [...host.querySelectorAll("button")].find(node => node.textContent === "查看成果文件")!;
     await act(async () => { button.click(); await Promise.resolve(); await Promise.resolve(); });
     expect(fetcher).toHaveBeenCalledWith("/api/persistent-work/items/item:one", expect.anything());
-    expect(host.querySelector("a")?.getAttribute("href")).toBe("/api/persistent-work/items/item:one/artifacts/a");
+    expect(host.querySelector('a[href^="/api/persistent-work/"]')?.getAttribute("href")).toBe("/api/persistent-work/items/item:one/artifacts/a");
   } finally { await act(async () => root.unmount()); host.remove(); }
 });
 afterEach(() => vi.unstubAllGlobals());
+
+it("shows GSD progress without saying that it is waiting to be dispatched", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (path: string) => ({ ok: true, json: async () => path.endsWith("/scopes") ? { areas: [], workstreams: [] } : path.endsWith("/bots") ? { bots: [] } :
+    { items: [{ taskId: "gsd:t", goalId: "gsd:g", title: "开发目标", status: "gsd", workstreamId: "w", gsd: { error: null,
+      snapshot: { planning: true, completed_phases: 1, phase_count: 2, phases: [{ number: "1", name: "基础", disk_status: "complete" }] } } }] } })));
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => { root.render(createElement(PersistentWorkTrial)); await Promise.resolve(); await Promise.resolve(); });
+    expect(host.textContent).toContain("阶段进度：1/2"); expect(host.textContent).toContain("基础：阶段完成");
+    expect(host.textContent).toContain("不代表目标已验收"); expect(host.textContent).not.toContain("任务已提交，等待处理");
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});

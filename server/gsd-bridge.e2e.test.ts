@@ -16,6 +16,10 @@ it("exposes the installed GSD bridge skill to an isolated OpenMaus chief turn", 
     const chief = (await api("GET", "/api/bots")).body.bots[0];
     expect(chief.chiefOfStaff).toBe(true);
     const worker = (await api("POST", "/api/bots", { name: "Fixture coding worker", title: "软件开发工程师" })).body.bot;
+    const legacy = readFileSync(join(process.cwd(), "scripts", "testing", "gsd-chief-v1.md"), "utf8")
+      .replaceAll("{{OMB_GSD_BRIDGE}}", join(process.cwd(), "scripts", "gsd-bridge.mjs"));
+    expect((await api("POST", `/api/bots/${chief.id}/skill-template`, { name: "openmaus-gsd-bridge", description: "GSD coordination",
+      warnings: [], source: "local:openmaus-gsd-bridge", text: legacy, enabled: true })).status).toBe(201);
     const install = () => spawnSync(process.execPath, [join(process.cwd(), "scripts", "install-gsd-bridge.mjs")], { encoding: "utf8", windowsHide: true,
       env: { ...process.env, OMB_TEST_GSD_BRIDGE: "1", OMB_TEST_GSD_BASE: fixture.info.url }, timeout: 30_000 });
     const installed = install();
@@ -25,6 +29,8 @@ it("exposes the installed GSD bridge skill to an isolated OpenMaus chief turn", 
     expect(JSON.parse(repeated.stdout).skills.every((item: { existed: boolean }) => item.existed)).toBe(true);
     const listing = await api("GET", `/api/bots/${chief.id}/skills`);
     expect(listing.body.skills.some((item: { name: string; enabled: boolean }) => item.name === "openmaus-gsd-bridge" && item.enabled)).toBe(true);
+    const updated = await api("GET", `/api/bots/${chief.id}/skills/openmaus-gsd-bridge`);
+    expect(updated.body.text).toContain("gsd-create-goal.ts");
     const workerListing = await api("GET", `/api/bots/${worker.id}/skills`);
     expect(workerListing.body.skills.some((item: { name: string; enabled: boolean }) => item.name === "openmaus-gsd-worker" && item.enabled)).toBe(true);
     await control(["send", "--bot", chief.id, "--text", "Use GSD for the isolated test."]);

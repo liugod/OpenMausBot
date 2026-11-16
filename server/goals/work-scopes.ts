@@ -114,13 +114,21 @@ export function createWorkScopeApi(db: DatabaseSync) {
         LEFT JOIN work_chat_links l ON l.goal_id=g.id AND l.owner_id=g.owner_id
         WHERE g.owner_id=? AND (? IS NULL OR w.area_id=?) AND t.plan_revision=g.plan_revision
         ORDER BY w.area_id, w.id, t.id`).all(ownerId, areaId ?? null, areaId ?? null);
-      return rows.map(row => {
+      const items = rows.map(row => {
         const task = z.object({ title: z.string(), assigneeBotId: z.string() }).parse(JSON.parse(String(row.task_json)));
         return { taskId: String(row.task_id), title: task.title, assigneeBotId: task.assigneeBotId, status: String(row.task_status), areaId: String(row.area_id),
           workstreamId: String(row.workstream_id), ...(row.container_id ? { itemId: String(row.container_id) } : { goalId: String(row.goal_id) }),
           ...(row.blocker ? { blocker: String(row.blocker) } : {}),
           ...(row.source_thread_id ? { sourceThreadId: String(row.source_thread_id) } : {}) };
       });
+      const gsd = db.prepare(`SELECT g.id AS goal_id, g.title, COALESCE(l.viewer_bot_id, g.lead_bot_id) AS lead_bot_id, w.id AS workstream_id, w.area_id,
+        l.task_id, l.snapshot_json, l.synced_at, l.error FROM goal_gsd_links l JOIN goals g ON g.id=l.goal_id AND g.owner_id=l.owner_id
+        JOIN goal_workstreams x ON x.goal_id=g.id AND x.owner_id=g.owner_id JOIN work_streams w ON w.id=x.workstream_id AND w.owner_id=x.owner_id
+        WHERE g.owner_id=? AND (? IS NULL OR w.area_id=?) ORDER BY g.created_at`).all(ownerId, areaId ?? null, areaId ?? null);
+      return [...items, ...gsd.map(row => ({ taskId: `gsd:${String(row.task_id)}`, title: String(row.title), assigneeBotId: String(row.lead_bot_id),
+        status: "gsd", areaId: String(row.area_id), workstreamId: String(row.workstream_id), goalId: String(row.goal_id),
+        gsd: { taskId: String(row.task_id), snapshot: row.snapshot_json ? JSON.parse(String(row.snapshot_json)) as unknown : null,
+          syncedAt: row.synced_at ? Number(row.synced_at) : null, error: row.error ? String(row.error) : null } }))];
     },
     budgets(ownerId: string) {
       id.parse(ownerId);

@@ -6,6 +6,7 @@ import { openExecutionBudgetStore, type DispatchIntent } from "./execution-budge
 import { openGoalStore } from "./goal-store.ts";
 import { createGoalScheduler } from "./scheduler.ts";
 import { createGoalToolDispatcher } from "./tool-dispatch.ts";
+import { syncGsdGoals } from "./gsd-sync.ts";
 import type { GoalRunContext } from "./goal-store.ts";
 import type { GoalRuntimePort } from "./runtime-port.ts";
 
@@ -43,6 +44,14 @@ export function createPersistentGoalHost(options: {
     return options.isCurrentTurn(context) === true ? context : undefined;
   }
   let processing: Promise<void> | undefined;
+  let gsdProcessing: Promise<void> | undefined;
+  let lastGsdSync = 0;
+  function syncGsd() {
+    if (closed || gsdProcessing || Date.now() - lastGsdSync < 15_000) return;
+    lastGsdSync = Date.now();
+    gsdProcessing = syncGsdGoals(options.dataDir, goals).catch(() => options.log("GSD goal sync failed"))
+      .finally(() => { gsdProcessing = undefined; });
+  }
   let cursor = { goalId: "", taskId: "" };
   function processChecks(): Promise<void> {
     if (processing) return processing;
@@ -113,7 +122,9 @@ export function createPersistentGoalHost(options: {
         resolveAuthorizedRoots: (_context, workspace) => options.resolveAuthorizedRoots?.(workspace) ?? [] });
         next.tick();
         void processChecks();
+        syncGsd();
         timer = setInterval(() => {
+          syncGsd();
           if (processing) return;
           try { next.tick(); void processChecks(); } catch { options.log("persistent goal scheduler tick failed"); }
         }, 5000);
@@ -137,6 +148,7 @@ export function createPersistentGoalHost(options: {
       closed = true;
       if (timer) clearInterval(timer);
       if (processing) await processing;
+      if (gsdProcessing) await gsdProcessing;
       runtimePort = undefined; dispatchTool = undefined;
       try { scheduler?.close(); } finally { try { budget.close(); } finally { goals.close(); } }
     },

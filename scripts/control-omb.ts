@@ -165,6 +165,8 @@ export function verificationServerEnvironment(parentEnv: NodeJS.ProcessEnv, data
   });
   if (parentEnv.OMB_TEST_GSD_BRIDGE === "1") {
     childEnv.OMB_GSD_STATE_DIR = join(dataDir, "gsd-integration");
+    childEnv.OMB_TEST_GSD_BRIDGE = "1";
+    childEnv.OMB_TEST_GSD_BASE = `http://127.0.0.1:${port}`;
     if (parentEnv.OMB_GSD_GIT && existsSync(parentEnv.OMB_GSD_GIT)) {
       childEnv.OMB_GSD_GIT = parentEnv.OMB_GSD_GIT;
       childEnv.OMB_EXTRA_PATH = [dirname(parentEnv.OMB_GSD_GIT), ...(process.platform === "win32" ? [join(childEnv.SYSTEMROOT || "C:\\Windows", "System32")] : [])].join(delimiter);

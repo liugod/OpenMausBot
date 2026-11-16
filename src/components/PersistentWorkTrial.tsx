@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 
 type Area = { id: string; name: string; status: string };
 type Stream = { id: string; areaId: string; name: string; kind: "project" | "ongoing"; status: string };
-type Work = { taskId: string; title: string; status: string; itemId?: string; goalId?: string; blocker?: string; workstreamId: string };
+type Work = { taskId: string; title: string; status: string; itemId?: string; goalId?: string; blocker?: string; workstreamId: string;
+  gsd?: { error: string | null; snapshot: null | { planning: boolean; completed_phases?: number; phase_count?: number; phases: { number: string; name: string; disk_status: string }[] } } };
 type Bot = { id: string; name: string; hidden?: boolean; modelSelection?: { instanceId: string } };
 type Artifact = { id: string; logicalName: string };
 const botLabel = (bot: Bot) => bot.name === "目标助手" ? "执行专员（目标助手）"
@@ -12,7 +13,8 @@ const call = async <T,>(url: string, method = "GET", body?: unknown): Promise<T>
   if (!res.ok) throw new Error(`请求失败（${res.status}）`);
   return await res.json() as T;
 };
-const status: Record<string, string> = { planned: "待执行", ready: "排队中", running: "执行中", checking: "检查与复核", succeeded: "已完成", blocked: "受阻", waiting_user: "需要处理", cancelled: "已取消" };
+const status: Record<string, string> = { planned: "待执行", ready: "排队中", running: "执行中", checking: "检查与复核", succeeded: "已完成", blocked: "受阻", waiting_user: "需要处理", cancelled: "已取消", gsd: "GSD 阶段" };
+const gsdStatus: Record<string, string> = { no_directory: "待开始", empty: "待开始", discussed: "已讨论", researched: "已研究", planned: "已规划", partial: "进行中", executed: "已执行，待确认", complete: "阶段完成" };
 const routeId = (value: string) => encodeURIComponent(value).replace(/%3A/gi, ":");
 const input = "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500";
 const button = "rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50";
@@ -66,6 +68,9 @@ export function PersistentWorkTrial() {
         <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-medium">{item.title}</span><span className="rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-700">{status[item.status] ?? item.status}</span></div>
         {item.status === "succeeded" && id ? <div className="mt-2"><p className="text-sm text-emerald-700">已完成并通过复核。点击下方按钮，再点文件名下载。</p><button className="mt-2 rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800" onClick={() => void showFiles(item)}>查看成果文件</button>
           {details[item.taskId] && (details[item.taskId]!.length ? <ul className="mt-2 space-y-1">{details[item.taskId]!.map(a => <li key={a.id}><a className="text-sm font-medium text-blue-700 underline" href={`/api/persistent-work/${type}/${routeId(id)}/artifacts/${encodeURIComponent(a.id)}`}>{a.logicalName} · 点击下载</a></li>)}</ul> : <p className="mt-2 text-sm text-slate-600">暂未找到可下载的成果。</p>)}</div>
+          : item.gsd ? <div className="mt-2 text-sm text-slate-600">{item.gsd.error && <p>同步暂时失败，显示最近一次记录。</p>}
+            {!item.gsd.snapshot ? <p>等待同步阶段信息。</p> : !item.gsd.snapshot.planning ? <p>尚未建立 GSD 阶段计划。</p> : <><p>阶段进度：{item.gsd.snapshot.completed_phases ?? 0}/{item.gsd.snapshot.phase_count ?? 0}；不代表目标已验收。</p>
+              <ul>{item.gsd.snapshot.phases.map(phase => <li key={phase.number}>{phase.number} · {phase.name}：{gsdStatus[phase.disk_status] ?? phase.disk_status}</li>)}</ul></>}</div>
           : <p className="mt-2 text-sm text-slate-600">{item.status === "checking" ? "正在检查并复核成果，请稍等。" : item.status === "running" ? "助手正在处理，请稍等。" : item.status === "blocked" ? "任务遇到问题，暂时无法继续。" : item.status === "waiting_user" ? "任务需要你的进一步说明。" : "任务已提交，等待处理。"}</p>}
       </li>; })}</ul>
     </section>}

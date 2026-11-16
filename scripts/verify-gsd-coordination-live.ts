@@ -25,7 +25,8 @@ try {
   const chief = (await api("POST", "/api/bots", { name: "GSD fixture chief", chiefOfStaff: true, modelSelection, settings: { approvalMode: "full" } })).bot;
   const worker = (await api("POST", "/api/bots", { name: "GSD fixture worker", title: "Coding engineer", modelSelection, settings: { approvalMode: "full" } })).bot;
   for (const [bot, name] of [[chief, "openmaus-gsd-bridge"], [worker, "openmaus-gsd-worker"]] as const) {
-    const text = readFileSync(join(process.cwd(), "skills", name, "SKILL.md"), "utf8").replaceAll("{{OMB_GSD_BRIDGE}}", bridge);
+    const text = readFileSync(join(process.cwd(), "skills", name, "SKILL.md"), "utf8").replaceAll("{{OMB_GSD_BRIDGE}}", bridge)
+      .replaceAll("{{OMB_GSD_GOAL}}", join(process.cwd(), "scripts", "gsd-create-goal.ts"));
     await api("POST", `/api/bots/${bot.id}/skill-template`, { name, description: "GSD integration fixture", warnings: [], source: `local:${name}`, text, enabled: true });
   }
   const prompt = `This is an isolated synthetic test. Use your openmaus-gsd-bridge skill to prepare GSD for repository ${repo} with task ID ${taskId}, then explicitly use coordinate_bots to assign the work to GSD fixture worker. Tell the worker to use its openmaus-gsd-worker skill and the installed gsd-fast workflow in the prepared worktree: create fixture-result.txt containing exactly "GSD fixture complete." including the period. There is no byte-length requirement; follow the literal text if any calculated length differs. Do not access the network, commit, push or modify the source repository. Wait for the worker's actual result and report it.`;

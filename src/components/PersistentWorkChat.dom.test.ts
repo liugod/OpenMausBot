@@ -6,6 +6,19 @@ import { PersistentWorkChat } from "./PersistentWorkChat";
 
 afterEach(() => vi.unstubAllGlobals());
 
+it("shows synced GSD phases without presenting them as accepted results", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ items: [{ taskId: "gsd:t", goalId: "gsd:g", title: "开发目标", status: "gsd", assigneeBotId: "bot",
+    gsd: { error: null, syncedAt: 1, snapshot: { planning: true, scope: "complete", completed_phases: 1, phase_count: 2,
+      phases: [{ number: "1", name: "基础", disk_status: "complete" }, { number: "2", name: "交付", disk_status: "partial" }] } } }] }) })));
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => { root.render(createElement(PersistentWorkChat, { botId: "bot", panel: true })); await Promise.resolve(); await Promise.resolve(); });
+    expect(host.textContent).toContain("阶段进度：1/2"); expect(host.textContent).toContain("基础：阶段完成");
+    expect(host.textContent).toContain("交付：进行中"); expect(host.textContent).toContain("不代表目标已验收");
+    expect([...host.querySelectorAll("button")].some(button => button.textContent === "查看报告")).toBe(false);
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
 it("shows only the current bot's tasks and opens the reviewed report", async () => {
   const fetcher = vi.fn(async (path: string) => {
     if (path.endsWith("/overview")) return { ok: true, json: async () => ({ items: [
